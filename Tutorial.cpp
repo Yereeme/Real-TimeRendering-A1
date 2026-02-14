@@ -1,28 +1,61 @@
-#include "Tutorial.hpp"
+﻿#include "Tutorial.hpp"
 
 #include "VK.hpp"
 
 #include <GLFW/glfw3.h>
+#include <variant>
 
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
+
+
  
 #include "external\tinyobjloader\tiny_obj_loader.h"
 
  
 #include "external\tinyobjloader\stb_image.h"
-#include "S72.hpp"
+ 
+static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*>& out);
 
 
 Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene_file(scene_file_) {
 
-	S72 scene = S72::load(scene_file_);
-	std::cout << "Loaded scene with "
-		<< scene.nodes.size()
-		<< " nodes\n";
+	use_s72_scene = !scene_file_.empty();
+	if (use_s72_scene) {
+		scene = S72::load(scene_file_);
+
+		std::cout << "[A1-load] scene: " << scene_file << "\n";
+		std::cout << "  nodes:      " << scene.nodes.size() << "\n";
+		std::cout << "  meshes:     " << scene.meshes.size() << "\n";
+		std::cout << "  cameras:    " << scene.cameras.size() << "\n";
+		std::cout << "  materials:  " << scene.materials.size() << "\n";
+		std::cout << "  textures:   " << scene.textures.size() << "\n";
+		std::cout << "  datafiles:  " << scene.data_files.size() << "\n";
+
+		collect_scene_cameras(scene, scene_camera_nodes);
+		std::cout << "[A1-show] scene cameras found: " << scene_camera_nodes.size() << "\n";
+
+		// pick defaults:
+		if (!scene_camera_nodes.empty()) active_scene_camera = 0;
+
+		// give debug camera a sensible starting pose:
+		debug_camera = free_camera;
+	}else{
+		// no scene; keep fallback mode
+		scene_camera_nodes.clear();
+		active_scene_camera = 0;
+		debug_camera = free_camera;
+	}
+
+
+	
 
 	 
 	//select a depth format:
@@ -44,8 +77,8 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, //LAYOUT IMAGE TRANSITIONED TO BEFORE THE LOAD
-				//.finalLayout = rtg.present_layout, layout image is transitioned to after the store
-			    .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, //layout image is transitioned to after the store
+			     
 			},
 			VkAttachmentDescription{ //1 - depth attachment:
 				.format = depth_format,
@@ -93,9 +126,9 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 				VkSubpassDependency{
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.dstSubpass = 0,
-				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcAccessMask = 0,
 				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 				}
 		};
@@ -296,279 +329,575 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 
 	}
 
-	{// create object vertices
-		std::vector< PosNorTexVertex > vertices;
+	{ //Pack S72 meshes into a single vertex buffer 
 
-		auto append_obj = [&](const std::string& obj_path) -> ObjectVertices {
-			ObjectVertices out;
-			out.first = uint32_t(vertices.size());
+	//--- cache raw bytes for each DataFile so we only read each file once:
+	std::unordered_map< S72::DataFile const*, std::vector<uint8_t> > data_cache;
 
-			tinyobj::attrib_t attrib;
-			std::vector<tinyobj::shape_t> shapes;
-			std::string warn, err;
+	auto load_datafile = [&](S72::DataFile const& df) -> std::vector<uint8_t> const& {
+		S72::DataFile const* key = &df;
+		auto it = data_cache.find(key);
+		if (it != data_cache.end()) return it->second;
 
-			bool ok = tinyobj::LoadObj(
-				&attrib,
-				&shapes,
-				nullptr,          // no mtl
-				&warn,
-				&err,
-				obj_path.c_str(),
-				"data/",          // base dir
-				true              // triangulate
-			);
+		std::ifstream in(df.path, std::ios::binary);
+		if (!in) {
+			throw std::runtime_error("Failed to open data file: " + df.path);
+		}
 
-			if (!warn.empty()) std::cout << warn << std::endl;
-			if (!err.empty())  std::cout << err << std::endl;
-			if (!ok) {
-				std::cout << "Failed to load " << obj_path << std::endl;
-				out.count = 0;
-				return out;
+		in.seekg(0, std::ios::end);
+		std::streamsize sz = in.tellg();
+		in.seekg(0, std::ios::beg);
+
+		std::vector<uint8_t> bytes;
+		bytes.resize(size_t(sz));
+		if (sz > 0) {
+			in.read(reinterpret_cast<char*>(bytes.data()), sz);
+		}
+
+		auto [inserted_it, ok] = data_cache.emplace(key, std::move(bytes));
+		return inserted_it->second;
+		};
+
+	auto find_attr = [&](S72::Mesh const& mesh, std::initializer_list<const char*> names) -> S72::Mesh::Attribute const* {
+		for (auto n : names) {
+			auto it = mesh.attributes.find(n);
+			if (it != mesh.attributes.end()) return &it->second;
+		}
+		return nullptr;
+		};
+
+	auto read_vec3_f32 = [&](std::vector<uint8_t> const& bytes, size_t byte_offset) -> S72::vec3 {
+		// assumes little-endian float32, which is what your class data will be
+		if (byte_offset + 12 > bytes.size()) return S72::vec3{ 0,0,0 };
+		float const* f = reinterpret_cast<float const*>(bytes.data() + byte_offset);
+		return S72::vec3{ f[0], f[1], f[2] };
+		};
+
+	auto read_vec2_f32 = [&](std::vector<uint8_t> const& bytes, size_t byte_offset) -> std::pair<float, float> {
+		if (byte_offset + 8 > bytes.size()) return { 0.0f, 0.0f };
+		float const* f = reinterpret_cast<float const*>(bytes.data() + byte_offset);
+		return { f[0], f[1] };
+		};
+
+	auto read_index = [&](std::vector<uint8_t> const& bytes, size_t byte_offset, VkIndexType type) -> uint32_t {
+		if (type == VK_INDEX_TYPE_UINT16) {
+			if (byte_offset + 2 > bytes.size()) return 0;
+			uint16_t const* p = reinterpret_cast<uint16_t const*>(bytes.data() + byte_offset);
+			return uint32_t(*p);
+		}
+		else if (type == VK_INDEX_TYPE_UINT32) {
+			if (byte_offset + 4 > bytes.size()) return 0;
+			uint32_t const* p = reinterpret_cast<uint32_t const*>(bytes.data() + byte_offset);
+			return *p;
+		}
+		else {
+			// unsupported index type
+			return 0;
+		}
+		};
+
+	//--- pack everything:
+	std::vector< PosNorTexVertex > packed;
+	packed.reserve(4096);
+
+	s72_mesh_to_range.clear();
+
+
+	// NOTE: scene.meshes is an unordered_map, so iteration order is arbitrary.
+	// That's fine for now as long as we build instances using Mesh* later, not by index.
+	for (auto const& kv : scene.meshes) {
+		S72::Mesh const& mesh = kv.second;
+		S72::Mesh const* mesh_ptr = &mesh;
+
+
+		ObjectVertices range;
+		range.first = uint32_t(packed.size());
+
+		// We’ll support the common attribute names used in s72/glTF style exports.
+		// If your exporter uses different keys, add them here.
+		S72::Mesh::Attribute const* posA = find_attr(mesh, { "POSITION", "position", "pos" });
+		S72::Mesh::Attribute const* norA = find_attr(mesh, { "NORMAL", "normal", "nor" });
+		S72::Mesh::Attribute const* uvA = find_attr(mesh, { "TEXCOORD", "TEXCOORD_0", "texcoord", "uv", "UV" });
+
+		if (!posA) {
+			std::cout << "[A1-load] mesh '" << mesh.name << "' has no POSITION attribute; skipping.\n";
+			range.count = 0;
+			s72_mesh_to_range[mesh_ptr] = range;
+
+			continue;
+		}
+
+		// Basic format sanity (you can relax later if needed):
+		if (posA->format != VK_FORMAT_R32G32B32_SFLOAT) {
+			std::cout << "[A1-load] mesh '" << mesh.name << "' POSITION format not vec3 f32; skipping.\n";
+			range.count = 0;
+			s72_mesh_to_range[mesh_ptr] = range;
+
+			continue;
+		}
+		if (norA && norA->format != VK_FORMAT_R32G32B32_SFLOAT) {
+			norA = nullptr; // ignore weird normals for now
+		}
+		if (uvA && uvA->format != VK_FORMAT_R32G32_SFLOAT) {
+			uvA = nullptr; // ignore weird uvs for now
+		}
+
+		// Load the underlying data files:
+		auto const& posBytes = load_datafile(posA->src);
+		std::vector<uint8_t> const* norBytes = nullptr;
+		std::vector<uint8_t> const* uvBytes = nullptr;
+
+		if (norA) norBytes = &load_datafile(norA->src);
+		if (uvA)  uvBytes = &load_datafile(uvA->src);
+
+		auto emit_vertex = [&](uint32_t vtx_index) {
+			size_t pos_off = size_t(posA->offset) + size_t(vtx_index) * size_t(posA->stride);
+			S72::vec3 p = read_vec3_f32(posBytes, pos_off);
+
+			S72::vec3 n{ 0.0f, 0.0f, 1.0f };
+			if (norA && norBytes) {
+				size_t nor_off = size_t(norA->offset) + size_t(vtx_index) * size_t(norA->stride);
+				n = read_vec3_f32(*norBytes, nor_off);
 			}
 
-			for (const auto& shape : shapes) {
-				size_t index_offset = 0;
-				for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f) {
-					int fv = shape.mesh.num_face_vertices[f];
-					if (fv < 3) { index_offset += fv; continue; }
-
-					for (int v = 0; v < 3; ++v) {
-						tinyobj::index_t idx = shape.mesh.indices[index_offset + v];
-
-						float px = attrib.vertices[3 * idx.vertex_index + 0];
-						float py = attrib.vertices[3 * idx.vertex_index + 1];
-						float pz = attrib.vertices[3 * idx.vertex_index + 2];
-
-						float nx = 0, ny = 0, nz = 1;
-						if (idx.normal_index >= 0 && !attrib.normals.empty()) {
-							nx = attrib.normals[3 * idx.normal_index + 0];
-							ny = attrib.normals[3 * idx.normal_index + 1];
-							nz = attrib.normals[3 * idx.normal_index + 2];
-						}
-
-						float ts = 0, tt = 0;
-						if (idx.texcoord_index >= 0 && !attrib.texcoords.empty()) {
-							ts = attrib.texcoords[2 * idx.texcoord_index + 0];
-							tt = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
-
-						}
-
-						vertices.emplace_back(PosNorTexVertex{
-							.Position{.x = px, .y = py, .z = pz},
-							.Normal{.x = nx, .y = ny, .z = nz},
-							.TexCoord{.s = ts, .t = tt},
-							});
-					}
-					index_offset += fv;
-				}
+			float s = 0.0f, t = 0.0f;
+			if (uvA && uvBytes) {
+				size_t uv_off = size_t(uvA->offset) + size_t(vtx_index) * size_t(uvA->stride);
+				auto uv = read_vec2_f32(*uvBytes, uv_off);
+				s = uv.first;
+				t = 1.0f - uv.second; // flip V like you already do
 			}
 
-			out.count = uint32_t(vertices.size()) - out.first;
-			std::cout << "Loaded " << obj_path << " verts=" << out.count << "\n";
-			return out;
+			packed.emplace_back(PosNorTexVertex{
+				.Position{.x = p.x, .y = p.y, .z = p.z },
+				.Normal  {.x = n.x, .y = n.y, .z = n.z },
+				.TexCoord{.s = s,   .t = t   },
+				});
 			};
 
-		chen_body_vertices = append_obj("data/chen_body.obj");
-		chen_clothes_vertices = append_obj("data/chen_clothes.obj");
-		chen_hairs_vertices = append_obj("data/chen_hairs.obj");
-		chen_face_vertices = append_obj("data/chen_face.obj");
-		chen_iris_vertices = append_obj("data/chen_iris.obj");
-		chen_sword_vertices = append_obj("data/chen_sword.obj");
+		// Expand indices (or emit sequential vertices if non-indexed):
+		if (mesh.indices.has_value()) {
+			auto const& idx = mesh.indices.value();
+			auto const& idxBytes = load_datafile(idx.src);
 
+			// We assume triangles for now. If not triangles, we still just expand in given order.
+			for (uint32_t i = 0; i < mesh.count; ++i) {
+				size_t idx_off = size_t(idx.offset);
+				if (idx.format == VK_INDEX_TYPE_UINT16) idx_off += size_t(i) * 2;
+				else idx_off += size_t(i) * 4;
 
-
-
-
-		{//A [-1,1]x[-1,1]x{0} quadrilateral:
-			plane_vertices.first = uint32_t(vertices.size());
-
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = -1.0f, .y = -1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
-				.TexCoord{.s = 0.0f, .t = 0.0f },
-
-				});
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = 1.0f, .y = -1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
-				.TexCoord{.s = 1.0f, .t = 0.0f },
-
-				});
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = -1.0f, .y = 1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
-				.TexCoord{.s = 0.0f, .t = 1.0f },
-
-				});
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = 1.0f, .y = 1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
-				.TexCoord{.s = 1.0f, .t = 1.0f },
-				});
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = -1.0f, .y = 1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f},
-				.TexCoord{.s = 0.0f, .t = 1.0f },
-				});
-			vertices.emplace_back(PosNorTexVertex{
-				.Position{.x = 1.0f, .y = -1.0f, .z = 0.0f },
-				.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f},
-				.TexCoord{.s = 1.0f, .t = 0.0f },
-				});
-
-			plane_vertices.count = uint32_t(vertices.size()) - plane_vertices.first;
+				uint32_t v = read_index(idxBytes, idx_off, idx.format);
+				emit_vertex(v);
+			}
+		}
+		else {
+			for (uint32_t v = 0; v < mesh.count; ++v) emit_vertex(v);
 		}
 
-		{ // A torus:
-			torus_vertices.first = uint32_t(vertices.size());
+		range.count = uint32_t(packed.size()) - range.first;
+		s72_mesh_to_range[mesh_ptr] = range;
 
-			//torus!
-			//will parameterize with (u,v) where:
-			// - u is angle around main axis (+z)
-			// - v is angle around the tube
 
-			constexpr float R1 = 0.75f; //main radius
-			constexpr float R2 = 0.15F; //tube radius
+		std::cout << "[A1-load] mesh '" << mesh.name << "' packed verts=" << range.count << "\n";
+		std::cout << "[A1-load] mesh->range entries = " << s72_mesh_to_range.size() << "\n";
 
-			constexpr uint32_t U_STEPS = 20;
-			constexpr uint32_t V_STEPS = 16;
+	}
 
-			//texture repeats around the torus:
-			constexpr float V_REPEATS = 2.0f;
-			constexpr float U_REPEATS = int(V_REPEATS / R2 * R1 + 0.999f); //approximately square, 
-			//rounded up
+	// Upload packed buffer:
+	size_t bytes = packed.size() * sizeof(packed[0]);
 
-			auto emplace_vertex = [&](uint32_t ui, uint32_t vi) {
-				//convert steps to angles:
-				// (doing the mod since trig on 2 M_PI nay not exactly match 0)
-				float ua = (ui % U_STEPS) / float(U_STEPS) * 2.0F * float(M_PI);
-				float va = (vi % V_STEPS) / float(V_STEPS) * 2.0F * float(M_PI);
+	if (object_vertices.handle != VK_NULL_HANDLE) {
+		rtg.helpers.destroy_buffer(std::move(object_vertices));
+	}
+
+	object_vertices = rtg.helpers.create_buffer(
+		bytes,
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		Helpers::Unmapped
+	);
+
+	if (!packed.empty()) {
+		rtg.helpers.transfer_to_buffer(packed.data(), bytes, object_vertices);
+	}
+
+	std::cout << "[A1-load] S72 packed total verts=" << packed.size() << " bytes=" << bytes << "\n";
+}
+
+
+	if (scene_file.empty()) {
+		{// create object vertices
+
+			std::vector< PosNorTexVertex > vertices;
+
+			auto append_obj = [&](const std::string& obj_path) -> ObjectVertices {
+				ObjectVertices out;
+				out.first = uint32_t(vertices.size());
+
+				tinyobj::attrib_t attrib;
+				std::vector<tinyobj::shape_t> shapes;
+				std::string warn, err;
+
+				bool ok = tinyobj::LoadObj(
+					&attrib,
+					&shapes,
+					nullptr,          // no mtl
+					&warn,
+					&err,
+					obj_path.c_str(),
+					"data/",          // base dir
+					true              // triangulate
+				);
+
+				if (!warn.empty()) std::cout << warn << std::endl;
+				if (!err.empty())  std::cout << err << std::endl;
+				if (!ok) {
+					std::cout << "Failed to load " << obj_path << std::endl;
+					out.count = 0;
+					return out;
+				}
+
+				for (const auto& shape : shapes) {
+					size_t index_offset = 0;
+					for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f) {
+						int fv = shape.mesh.num_face_vertices[f];
+						if (fv < 3) { index_offset += fv; continue; }
+
+						for (int v = 0; v < 3; ++v) {
+							tinyobj::index_t idx = shape.mesh.indices[index_offset + v];
+
+							float px = attrib.vertices[3 * idx.vertex_index + 0];
+							float py = attrib.vertices[3 * idx.vertex_index + 1];
+							float pz = attrib.vertices[3 * idx.vertex_index + 2];
+
+							float nx = 0, ny = 0, nz = 1;
+							if (idx.normal_index >= 0 && !attrib.normals.empty()) {
+								nx = attrib.normals[3 * idx.normal_index + 0];
+								ny = attrib.normals[3 * idx.normal_index + 1];
+								nz = attrib.normals[3 * idx.normal_index + 2];
+							}
+
+							float ts = 0, tt = 0;
+							if (idx.texcoord_index >= 0 && !attrib.texcoords.empty()) {
+								ts = attrib.texcoords[2 * idx.texcoord_index + 0];
+								tt = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
+
+							}
+
+							vertices.emplace_back(PosNorTexVertex{
+								.Position{.x = px, .y = py, .z = pz},
+								.Normal{.x = nx, .y = ny, .z = nz},
+								.TexCoord{.s = ts, .t = tt},
+								});
+						}
+						index_offset += fv;
+					}
+				}
+
+				out.count = uint32_t(vertices.size()) - out.first;
+				std::cout << "Loaded " << obj_path << " verts=" << out.count << "\n";
+				return out;
+				};
+
+			chen_body_vertices = append_obj("data/chen_body.obj");
+			chen_clothes_vertices = append_obj("data/chen_clothes.obj");
+			chen_hairs_vertices = append_obj("data/chen_hairs.obj");
+			chen_face_vertices = append_obj("data/chen_face.obj");
+			chen_iris_vertices = append_obj("data/chen_iris.obj");
+			chen_sword_vertices = append_obj("data/chen_sword.obj");
+
+
+
+
+
+			{//A [-1,1]x[-1,1]x{0} quadrilateral:
+				plane_vertices.first = uint32_t(vertices.size());
 
 				vertices.emplace_back(PosNorTexVertex{
-					.Position{
-						.x = (R1 + R2 * std::cos(va)) * std::cos(ua),
-						.y = (R1 + R2 * std::cos(va)) * std::sin(ua),
-						.z = R2 * std::sin(va),
-					},
-					.Normal{
-						.x = std::cos(va) * std::cos(ua),
-						.y = std::cos(va) * std::sin(ua),
-						.z = std::sin(ua),
-					},
-					.TexCoord{
-						.s = ui / float(U_STEPS) * U_REPEATS,
-						.t = vi / float(V_STEPS) * V_REPEATS,
-					},
+					.Position{.x = -1.0f, .y = -1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
+					.TexCoord{.s = 0.0f, .t = 0.0f },
+
 					});
-				};
+				vertices.emplace_back(PosNorTexVertex{
+					.Position{.x = 1.0f, .y = -1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
+					.TexCoord{.s = 1.0f, .t = 0.0f },
 
-			for (uint32_t ui = 0; ui < U_STEPS; ++ui) {
-				for (uint32_t vi = 0; vi < V_STEPS; ++vi) {
-					emplace_vertex(ui, vi);
-					emplace_vertex(ui + 1, vi);
-					emplace_vertex(ui, vi + 1);
+					});
+				vertices.emplace_back(PosNorTexVertex{
+					.Position{.x = -1.0f, .y = 1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
+					.TexCoord{.s = 0.0f, .t = 1.0f },
 
-					emplace_vertex(ui, vi + 1);
-					emplace_vertex(ui + 1, vi);
-					emplace_vertex(ui + 1, vi + 1);
+					});
+				vertices.emplace_back(PosNorTexVertex{
+					.Position{.x = 1.0f, .y = 1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f },
+					.TexCoord{.s = 1.0f, .t = 1.0f },
+					});
+				vertices.emplace_back(PosNorTexVertex{
+					.Position{.x = -1.0f, .y = 1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f},
+					.TexCoord{.s = 0.0f, .t = 1.0f },
+					});
+				vertices.emplace_back(PosNorTexVertex{
+					.Position{.x = 1.0f, .y = -1.0f, .z = 0.0f },
+					.Normal{.x = 0.0f, .y = 0.0f, .z = 1.0f},
+					.TexCoord{.s = 1.0f, .t = 0.0f },
+					});
+
+				plane_vertices.count = uint32_t(vertices.size()) - plane_vertices.first;
+			}
+
+			{ // A torus:
+				torus_vertices.first = uint32_t(vertices.size());
+
+				//torus!
+				//will parameterize with (u,v) where:
+				// - u is angle around main axis (+z)
+				// - v is angle around the tube
+
+				constexpr float R1 = 0.75f; //main radius
+				constexpr float R2 = 0.15F; //tube radius
+
+				constexpr uint32_t U_STEPS = 20;
+				constexpr uint32_t V_STEPS = 16;
+
+				//texture repeats around the torus:
+				constexpr float V_REPEATS = 2.0f;
+				constexpr float U_REPEATS = int(V_REPEATS / R2 * R1 + 0.999f); //approximately square, 
+				//rounded up
+
+				auto emplace_vertex = [&](uint32_t ui, uint32_t vi) {
+					//convert steps to angles:
+					// (doing the mod since trig on 2 M_PI nay not exactly match 0)
+					float ua = (ui % U_STEPS) / float(U_STEPS) * 2.0F * float(M_PI);
+					float va = (vi % V_STEPS) / float(V_STEPS) * 2.0F * float(M_PI);
+
+					vertices.emplace_back(PosNorTexVertex{
+						.Position{
+							.x = (R1 + R2 * std::cos(va)) * std::cos(ua),
+							.y = (R1 + R2 * std::cos(va)) * std::sin(ua),
+							.z = R2 * std::sin(va),
+						},
+						.Normal{
+							.x = std::cos(va) * std::cos(ua),
+							.y = std::cos(va) * std::sin(ua),
+							.z = std::sin(ua),
+						},
+						.TexCoord{
+							.s = ui / float(U_STEPS) * U_REPEATS,
+							.t = vi / float(V_STEPS) * V_REPEATS,
+						},
+						});
+					};
+
+				for (uint32_t ui = 0; ui < U_STEPS; ++ui) {
+					for (uint32_t vi = 0; vi < V_STEPS; ++vi) {
+						emplace_vertex(ui, vi);
+						emplace_vertex(ui + 1, vi);
+						emplace_vertex(ui, vi + 1);
+
+						emplace_vertex(ui, vi + 1);
+						emplace_vertex(ui + 1, vi);
+						emplace_vertex(ui + 1, vi + 1);
 
 
+					}
 				}
+
+				torus_vertices.count = uint32_t(vertices.size()) - torus_vertices.first;
 			}
 
-			torus_vertices.count = uint32_t(vertices.size()) - torus_vertices.first;
-		}
+			{ //A low-poly crystal (stylized gem) - simple + looks nice:
+				crystal_vertices.first = uint32_t(vertices.size());
 
-		{ //A low-poly crystal (stylized gem) - simple + looks nice:
-			crystal_vertices.first = uint32_t(vertices.size());
+				//local small vec type since PosNorTexVertex uses anonymous structs:
+				struct P3 { float x, y, z; };
 
-			//local small vec type since PosNorTexVertex uses anonymous structs:
-			struct P3 { float x, y, z; };
+				constexpr uint32_t STEPS = 10; //8-12 looks good
+				constexpr float R = 0.55f;   //ring radius
+				constexpr float TOP = 1.0f;    //top point height
+				constexpr float MID = 0.15f;   //ring height
+				constexpr float BOT = -0.9f;   //bottom point height
 
-			constexpr uint32_t STEPS = 10; //8-12 looks good
-			constexpr float R = 0.55f;   //ring radius
-			constexpr float TOP = 1.0f;    //top point height
-			constexpr float MID = 0.15f;   //ring height
-			constexpr float BOT = -0.9f;   //bottom point height
+				P3 top{ 0.0f, 0.0f, TOP };
+				P3 bot{ 0.0f, 0.0f, BOT };
 
-			P3 top{ 0.0f, 0.0f, TOP };
-			P3 bot{ 0.0f, 0.0f, BOT };
+				auto add_tri = [&](P3 p0, P3 p1, P3 p2, P3 n,
+					float s0, float t0,
+					float s1, float t1,
+					float s2, float t2) {
+						vertices.emplace_back(PosNorTexVertex{
+							.Position{.x = p0.x, .y = p0.y, .z = p0.z },
+							.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
+							.TexCoord{.s = s0, .t = t0 },
+							});
+						vertices.emplace_back(PosNorTexVertex{
+							.Position{.x = p1.x, .y = p1.y, .z = p1.z },
+							.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
+							.TexCoord{.s = s1, .t = t1 },
+							});
+						vertices.emplace_back(PosNorTexVertex{
+							.Position{.x = p2.x, .y = p2.y, .z = p2.z },
+							.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
+							.TexCoord{.s = s2, .t = t2 },
+							});
+					};
 
-			auto add_tri = [&](P3 p0, P3 p1, P3 p2, P3 n,
-				float s0, float t0,
-				float s1, float t1,
-				float s2, float t2) {
-					vertices.emplace_back(PosNorTexVertex{
-						.Position{.x = p0.x, .y = p0.y, .z = p0.z },
-						.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
-						.TexCoord{.s = s0, .t = t0 },
-						});
-					vertices.emplace_back(PosNorTexVertex{
-						.Position{.x = p1.x, .y = p1.y, .z = p1.z },
-						.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
-						.TexCoord{.s = s1, .t = t1 },
-						});
-					vertices.emplace_back(PosNorTexVertex{
-						.Position{.x = p2.x, .y = p2.y, .z = p2.z },
-						.Normal{.x = n.x,  .y = n.y,  .z = n.z  },
-						.TexCoord{.s = s2, .t = t2 },
-						});
-				};
+				auto ring_point = [&](uint32_t i) -> P3 {
+					float a = (i % STEPS) / float(STEPS) * 2.0f * float(M_PI);
+					return P3{ R * std::cos(a), R * std::sin(a), MID };
+					};
 
-			auto ring_point = [&](uint32_t i) -> P3 {
-				float a = (i % STEPS) / float(STEPS) * 2.0f * float(M_PI);
-				return P3{ R * std::cos(a), R * std::sin(a), MID };
-				};
+				for (uint32_t i = 0; i < STEPS; ++i) {
+					P3 p0 = ring_point(i);
+					P3 p1 = ring_point(i + 1);
 
-			for (uint32_t i = 0; i < STEPS; ++i) {
-				P3 p0 = ring_point(i);
-				P3 p1 = ring_point(i + 1);
+					//outward-ish normals, good enough for now:
+					float mx = (p0.x + p1.x) * 0.5f;
+					float my = (p0.y + p1.y) * 0.5f;
 
-				//outward-ish normals, good enough for now:
-				float mx = (p0.x + p1.x) * 0.5f;
-				float my = (p0.y + p1.y) * 0.5f;
+					P3 nTop{ mx, my, 1.0f };
+					P3 nBot{ mx, my, -1.0f };
 
-				P3 nTop{ mx, my, 1.0f };
-				P3 nBot{ mx, my, -1.0f };
+					//top faces (CCW from outside)
+					add_tri(p0, p1, top, nTop,
+						i / float(STEPS), 0.0f,
+						(i + 1) / float(STEPS), 0.0f,
+						(i + 0.5f) / float(STEPS), 1.0f);
 
-				//top faces (CCW from outside)
-				add_tri(p0, p1, top, nTop,
-					i / float(STEPS), 0.0f,
-					(i + 1) / float(STEPS), 0.0f,
-					(i + 0.5f) / float(STEPS), 1.0f);
+					//bottom faces (CCW from outside)
+					add_tri(p1, p0, bot, nBot,
+						(i + 1) / float(STEPS), 0.0f,
+						i / float(STEPS), 0.0f,
+						(i + 0.5f) / float(STEPS), 1.0f);
+				}
 
-				//bottom faces (CCW from outside)
-				add_tri(p1, p0, bot, nBot,
-					(i + 1) / float(STEPS), 0.0f,
-					i / float(STEPS), 0.0f,
-					(i + 0.5f) / float(STEPS), 1.0f);
+				crystal_vertices.count = uint32_t(vertices.size()) - crystal_vertices.first;
 			}
 
-			crystal_vertices.count = uint32_t(vertices.size()) - crystal_vertices.first;
+
+
+
+
+
+
+			size_t bytes = vertices.size() * sizeof(vertices[0]);
+
+			object_vertices = rtg.helpers.create_buffer(
+				bytes,
+				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				Helpers::Unmapped
+			);
+
+			//copy data to buffer:
+			rtg.helpers.transfer_to_buffer(vertices.data(), bytes, object_vertices);
 		}
-
-		
-
-
-
-
-
-		size_t bytes = vertices.size() * sizeof(vertices[0]);
-
-		object_vertices = rtg.helpers.create_buffer(
-			bytes,
-			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-			Helpers::Unmapped
-		);
-
-		//copy data to buffer:
-		rtg.helpers.transfer_to_buffer(vertices.data(), bytes, object_vertices);
 	}
 
 	{ //make some textures
 		textures.reserve(3);
 		//textures.reserve(2);
+
+		auto load_png_texture_srgb = [&](std::string const& tex_path) -> uint32_t {
+			auto it = s72_texture_path_to_index.find(tex_path);
+			if (it != s72_texture_path_to_index.end()) return it->second;
+
+			int w = 0, h = 0, n = 0;
+			stbi_uc* pixels = stbi_load(tex_path.c_str(), &w, &h, &n, 4);
+			if (!pixels) {
+				std::cout << "[A1-show] failed to load texture: " << tex_path << "\n";
+				return 0; // checker fallback
+			}
+
+			textures.emplace_back(rtg.helpers.create_image(
+				VkExtent2D{ .width = uint32_t(w), .height = uint32_t(h) },
+				VK_FORMAT_R8G8B8A8_SRGB,
+				VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				Helpers::Unmapped
+			));
+
+			rtg.helpers.transfer_to_image(pixels, size_t(w) * size_t(h) * 4, textures.back());
+			stbi_image_free(pixels);
+
+			uint32_t idx = uint32_t(textures.size() - 1);
+			s72_texture_path_to_index[tex_path] = idx;
+			return idx;
+			};
+
+		auto make_solid_srgb_texture = [&](S72::color const& c) -> uint32_t {
+			// quantize to 8-bit and use as a cache key:
+			auto to_u8 = [](float v) -> uint8_t {
+				v = std::max(0.0f, std::min(1.0f, v));
+				return uint8_t(std::round(v * 255.0f));
+				};
+			uint8_t r = to_u8(c.r), g = to_u8(c.g), b = to_u8(c.b);
+
+			char key[64];
+			std::snprintf(key, sizeof(key), "solid_%u_%u_%u", r, g, b);
+			auto it = s72_texture_path_to_index.find(key);
+			if (it != s72_texture_path_to_index.end()) return it->second;
+
+			uint32_t pixel = uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | (0xffu << 24);
+
+			textures.emplace_back(rtg.helpers.create_image(
+				VkExtent2D{ .width = 1, .height = 1 },
+				VK_FORMAT_R8G8B8A8_SRGB,
+				VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				Helpers::Unmapped
+			));
+
+			rtg.helpers.transfer_to_image(&pixel, sizeof(pixel), textures.back());
+
+			uint32_t idx = uint32_t(textures.size() - 1);
+			s72_texture_path_to_index[key] = idx;
+			return idx;
+			};
+
+		// --- Build material->texture mapping for S72:
+		if (use_s72_scene) {
+			material_to_texture.clear();
+
+			for (auto const& mkv : scene.materials) {
+				S72::Material const& mat = mkv.second;
+				uint32_t tex_idx = 0;
+
+				// handle Lambertian + PBR albedo only (enough for A1-show)
+				if (auto const* lam = std::get_if<S72::Material::Lambertian>(&mat.brdf)) {
+					if (std::holds_alternative<S72::color>(lam->albedo)) {
+						tex_idx = make_solid_srgb_texture(std::get<S72::color>(lam->albedo));
+					}
+					else {
+						S72::Texture* t = std::get<S72::Texture*>(lam->albedo);
+						if (t && t->type == S72::Texture::Type::flat) {
+							tex_idx = load_png_texture_srgb(t->path);
+						}
+					}
+				}
+				else if (auto const* pbr = std::get_if<S72::Material::PBR>(&mat.brdf)) {
+					if (std::holds_alternative<S72::color>(pbr->albedo)) {
+						tex_idx = make_solid_srgb_texture(std::get<S72::color>(pbr->albedo));
+					}
+					else {
+						S72::Texture* t = std::get<S72::Texture*>(pbr->albedo);
+						if (t && t->type == S72::Texture::Type::flat) {
+							tex_idx = load_png_texture_srgb(t->path);
+						}
+					}
+				}
+
+				material_to_texture[&mat] = tex_idx;
+			}
+
+			std::cout << "[A1-show] mapped materials -> textures: " << material_to_texture.size() << "\n";
+		}
 
 		{ //texture 0 will be a dark grey / light grey checkerboard with a red square at the origin.
 			//actually make the texture:
@@ -632,42 +961,43 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 			}
 
 
+			if (scene_file.empty()) {
+				auto load_png_texture = [&](std::string const& tex_path) -> uint32_t {
+					int w = 0, h = 0, n = 0;
+					stbi_uc* pixels = stbi_load(tex_path.c_str(), &w, &h, &n, 4);
+					if (!pixels) {
+						std::cout << "stb_image failed to load: " << tex_path << std::endl;
+						return 0; //fallback to texture 0
+					}
 
-			auto load_png_texture = [&](std::string const& tex_path) -> uint32_t {
-				int w = 0, h = 0, n = 0;
-				stbi_uc* pixels = stbi_load(tex_path.c_str(), &w, &h, &n, 4);
-				if (!pixels) {
-					std::cout << "stb_image failed to load: " << tex_path << std::endl;
-					return 0; //fallback to texture 0
-				}
+					textures.emplace_back(rtg.helpers.create_image(
+						VkExtent2D{ .width = uint32_t(w), .height = uint32_t(h) },
+						VK_FORMAT_R8G8B8A8_SRGB,
+						VK_IMAGE_TILING_OPTIMAL,
+						VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+						VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+						Helpers::Unmapped
+					));
 
-				textures.emplace_back(rtg.helpers.create_image(
-					VkExtent2D{ .width = uint32_t(w), .height = uint32_t(h) },
-					VK_FORMAT_R8G8B8A8_SRGB,
-					VK_IMAGE_TILING_OPTIMAL,
-					VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-					Helpers::Unmapped
-				));
+					rtg.helpers.transfer_to_image(pixels, size_t(w) * size_t(h) * 4, textures.back());
+					stbi_image_free(pixels);
 
-				rtg.helpers.transfer_to_image(pixels, size_t(w) * size_t(h) * 4, textures.back());
-				stbi_image_free(pixels);
+					uint32_t idx = uint32_t(textures.size() - 1);
+					std::cout << "Loaded texture[" << idx << "]: " << tex_path << " (" << w << "x" << h << ")\n";
+					return idx;
+					};
 
-				uint32_t idx = uint32_t(textures.size() - 1);
-				std::cout << "Loaded texture[" << idx << "]: " << tex_path << " (" << w << "x" << h << ")\n";
-				return idx;
-				};
 
-			 
 
-			// load textures and store the actual indices:
-			tex_body = load_png_texture("data/chen_body.png");
-			tex_clothes = load_png_texture("data/chen_clothes.png");
-			tex_hair = load_png_texture("data/chen_hair.png");
-			tex_sword = load_png_texture("data/chen_sword.png");
-			tex_iris = load_png_texture("data/chen_iris.png");
-			tex_face = load_png_texture("data/chen_face.png");
 
+				// load textures and store the actual indices:
+				tex_body = load_png_texture("data/chen_body.png");
+				tex_clothes = load_png_texture("data/chen_clothes.png");
+				tex_hair = load_png_texture("data/chen_hair.png");
+				tex_sword = load_png_texture("data/chen_sword.png");
+				tex_iris = load_png_texture("data/chen_iris.png");
+				tex_face = load_png_texture("data/chen_face.png");
+			}
 
 		
 	}
@@ -895,7 +1225,9 @@ Tutorial::~Tutorial() {
 
 void Tutorial::on_swapchain(RTG &rtg_, RTG::SwapchainEvent const &swapchain) {
 	 //TODO: clean up existing framebuffers
-
+	if (swapchain_depth_image.handle != VK_NULL_HANDLE) {
+		destroy_framebuffers();
+	}
 	//Allocate depth image for framebuffers to share:
 	swapchain_depth_image = rtg.helpers.create_image(
 		swapchain.extent,
@@ -1160,13 +1492,16 @@ void Tutorial::render(RTG& rtg_, RTG::RenderParams const& render_params) {
 	{//Memory barrier to make sure copies complete before rendering happens;
 		VkMemoryBarrier memory_barrier{
 			.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-			.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-			.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+			| VK_ACCESS_UNIFORM_READ_BIT
+			| VK_ACCESS_SHADER_READ_BIT,
 		};
 
-		vkCmdPipelineBarrier(workspace.command_buffer,
+		vkCmdPipelineBarrier(
+			workspace.command_buffer,
 			VK_PIPELINE_STAGE_TRANSFER_BIT, //srcStageMask
-			VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, //dstStageMask
+			VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			0, //dependencyFlags
 			1, &memory_barrier, //memoryBarriers (count, data)
 			0, nullptr, //bufferMemoryBarriers (count, data)
@@ -1199,22 +1534,10 @@ void Tutorial::render(RTG& rtg_, RTG::RenderParams const& render_params) {
 
 		//TODO: run pipelines here
 		{//set scissor rectangle
-			VkRect2D scissor{
-				.offset = {.x = 0, .y = 0},
-				.extent = rtg.swapchain_extent,
-			};
-			vkCmdSetScissor(workspace.command_buffer, 0, 1, &scissor);
+			vkCmdSetScissor(workspace.command_buffer, 0, 1, &draw_scissor);
 		}
 		{//configure viewport transform
-			VkViewport viewport{
-				.x = 0.0f,
-				.y = 0.0f,
-				.width = float(rtg.swapchain_extent.width),
-				.height = float(rtg.swapchain_extent.height),
-				.minDepth = 0.0f,
-				.maxDepth = 1.0f,
-			};
-			vkCmdSetViewport(workspace.command_buffer, 0, 1, &viewport);
+			vkCmdSetViewport(workspace.command_buffer, 0, 1, &draw_viewport);
 		}
 
 		{//draw with background pipeline:
@@ -1353,203 +1676,488 @@ void Tutorial::render(RTG& rtg_, RTG::RenderParams const& render_params) {
 		VK(vkQueueSubmit(rtg.graphics_queue, 1, &submit_info, render_params.workspace_available));
 	}
 }
-	
 
-			void Tutorial::update(float dt) {
-				//time += dt;
-				time = std::fmod(time + dt, 60.0f);
+static mat4 mat4_identity() {
+	return mat4{
+		1,0,0,0,
+		0,1,0,0,
+		0,0,1,0,
+		0,0,0,1
+	};
+}
 
-				if (camera_mode == CameraMode::Scene) { 
-					//camera rotating around the origin:
-					float ang = float(M_PI) * 2.0f * 10.0f * (time / 60.0f);
-					CLIP_FROM_WORLD = perspective(
-						60.0f * float(M_PI) / 180.0f, //vfov
-						rtg.swapchain_extent.width / float(rtg.swapchain_extent.height), //aspect
-						0.1f, //near
-						1000.0f //far
-					) * look_at(
-						3.0f * std::cos(ang), 3.0f * std::sin(ang), 1.0f, //eye
-						0.0f, 0.0f, 0.0f, //target
-						0.0f, 0.0f, 1.0f //up
-					);
-				} else if (camera_mode == CameraMode::Free) {
-					free_camera.target_x = 0.0f;
-					free_camera.target_y = 0.5f;
-					free_camera.target_z = 1.5f;
-					free_camera.radius = 2.8f;
+static mat4 mat4_translate(float x, float y, float z) {
+	return mat4{
+		1,0,0,0,
+		0,1,0,0,
+		0,0,1,0,
+		x,y,z,1
+	};
+}
 
-					CLIP_FROM_WORLD = perspective(
-						free_camera.fov,
-						rtg.swapchain_extent.width / float(rtg.swapchain_extent.height), //aspect
-						free_camera.near,
-						free_camera.far
-					) * orbit(
-						free_camera.target_x, free_camera.target_y, free_camera.target_z,
-						free_camera.azimuth, free_camera.elevation, free_camera.radius
-					);
-				} else {
-					assert(0 && "only two camera modes");
-				}
+static mat4 mat4_scale(float x, float y, float z) {
+	return mat4{
+		x,0,0,0,
+		0,y,0,0,
+		0,0,z,0,
+		0,0,0,1
+	};
+}
 
-				{ //static sun and sky:
-					world.SKY_DIRECTION.x = 0.0f;
-					world.SKY_DIRECTION.y = 0.0f;
-					world.SKY_DIRECTION.z = 1.0f;
+// quaternion (x,y,z,w) to rotation matrix:
+static mat4 mat4_from_quat(float x, float y, float z, float w) {
+	float xx = x * x, yy = y * y, zz = z * z;
+	float xy = x * y, xz = x * z, yz = y * z;
+	float wx = w * x, wy = w * y, wz = w * z;
 
-					world.SKY_ENERGY.r = 0.1f;
-					world.SKY_ENERGY.g = 0.1f;
-					world.SKY_ENERGY.b = 0.2f;
+	// column-major mat4 matching your existing usage (translation in last row)
+	return mat4{
+		1.0f - 2.0f * (yy + zz),  2.0f * (xy + wz),        2.0f * (xz - wy),        0.0f,
+		2.0f * (xy - wz),        1.0f - 2.0f * (xx + zz),  2.0f * (yz + wx),        0.0f,
+		2.0f * (xz + wy),        2.0f * (yz - wx),        1.0f - 2.0f * (xx + yy),  0.0f,
+		0.0f,                  0.0f,                  0.0f,                  1.0f
+	};
+}
 
-					world.SUN_DIRECTION.x = 6.0f / 23.0f;
-					world.SUN_DIRECTION.y = 13.0f / 23.0f;
-					world.SUN_DIRECTION.z = 18.0f / 23.0f;
+static mat4 mat4_mul(mat4 const& A, mat4 const& B) {
+	mat4 R{};
+	for (int c = 0; c < 4; ++c) {
+		for (int r = 0; r < 4; ++r) {
+			R[c * 4 + r] =
+				A[0 * 4 + r] * B[c * 4 + 0] +
+				A[1 * 4 + r] * B[c * 4 + 1] +
+				A[2 * 4 + r] * B[c * 4 + 2] +
+				A[3 * 4 + r] * B[c * 4 + 3];
+		}
+	}
+	return R;
+}
 
-					world.SUN_ENERGY.r = 1.0f;
-					world.SUN_ENERGY.g = 1.0f;
-					world.SUN_ENERGY.b = 0.9f;
-				}
+static mat4 mat4_inverse_rigid(mat4 const& M) {
+	// Assumes M is rotation + translation only (no scale/shear).
+	// Your mat4 is column-major; translation is in the last row (indices 12,13,14).
 
+	// Extract rotation (upper-left 3x3):
+	float r00 = M[0], r01 = M[4], r02 = M[8];
+	float r10 = M[1], r11 = M[5], r12 = M[9];
+	float r20 = M[2], r21 = M[6], r22 = M[10];
 
-				//
-				//lines_vertices.reserve(4);
-				{ //make some crossing lines at different depths:
-					lines_vertices.clear();
+	// Transpose rotation:
+	float t00 = r00, t01 = r10, t02 = r20;
+	float t10 = r01, t11 = r11, t12 = r21;
+	float t20 = r02, t21 = r12, t22 = r22;
 
+	// Translation (your convention):
+	float tx = M[12], ty = M[13], tz = M[14];
 
-					const int N = 60;
-					const float size = 1.0f;
-					const float step = (2.0f * size) / float(N);
-					size_t count = 4 * (N + 1) * N;
-					lines_vertices.reserve(count);
+	// New translation = -R^T * t
+	float ntx = -(t00 * tx + t01 * ty + t02 * tz);
+	float nty = -(t10 * tx + t11 * ty + t12 * tz);
+	float ntz = -(t20 * tx + t21 * ty + t22 * tz);
 
+	return mat4{
+		t00, t10, t20, 0.0f,
+		t01, t11, t21, 0.0f,
+		t02, t12, t22, 0.0f,
+		ntx, nty, ntz, 1.0f
+	};
+}
 
-					auto rippleY = [&](float x, float z) -> float {
-						float d = std::sqrt(x * x + z * z);
-						float y = std::sin(float(M_PI) * (4.0f * d - time));
-						y /= (1.0f + 10.0f * d);
-						return y;
-						};
+static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*>& out) {
+	out.clear();
 
-					// rows (z fixed, x changes)
-					for (int zi = 0; zi <= N; ++zi) {
-						float z = -size + zi * step;
-						for (int xi = 0; xi < N; ++xi) {
-							float x0 = -size + xi * step;
-							float x1 = x0 + step;
+	std::function<void(S72::Node const&)> walk;
+	walk = [&](S72::Node const& n) {
+		if (n.camera) out.emplace_back(&n);
+		for (S72::Node* child : n.children) {
+			if (child) walk(*child);
+		}
+		};
 
-							lines_vertices.emplace_back(PosColVertex{
-								.Position{.x = x0, .y = rippleY(x0, z), .z = z },
-								.Color{.r = 0xff, .g = 0xff, .b = 0x00, .a = 0xff }
-								});
-							lines_vertices.emplace_back(PosColVertex{
-								.Position{.x = x1, .y = rippleY(x1, z), .z = z },
-								.Color{.r = 0xff, .g = 0xff, .b = 0x00, .a = 0xff }
-								});
-						}
-					}
+	for (S72::Node* root : scene.scene.roots) {
+		if (root) walk(*root);
+	}
+}
 
-					// columns (x fixed, z changes)
-					for (int xi = 0; xi <= N; ++xi) {
-						float x = -size + xi * step;
-						for (int zi = 0; zi < N; ++zi) {
-							float z0 = -size + zi * step;
-							float z1 = z0 + step;
+void Tutorial::compute_letterbox(float target_aspect) {
+	//target_aspect == 0 => full screen
+	float W = float(rtg.swapchain_extent.width);
+	float H = float(rtg.swapchain_extent.height);
 
-							lines_vertices.emplace_back(PosColVertex{
-								.Position{.x = x, .y = rippleY(x, z0), .z = z0 },
-								.Color{.r = 0x44, .g = 0x00, .b = 0xff, .a = 0xff }
-								});
-							lines_vertices.emplace_back(PosColVertex{
-								.Position{.x = x, .y = rippleY(x, z1), .z = z1 },
-								.Color{.r = 0x44, .g = 0x00, .b = 0xff, .a = 0xff }
-								});
-						}
-					}
+	//default full screen:
+	draw_viewport = VkViewport{
+		.x = 0.0f,
+		.y = 0.0f,
+		.width = W,
+		.height = H,
+		.minDepth = 0.0f,
+		.maxDepth = 1.0f,
+	};
+	draw_scissor = VkRect2D{
+		.offset = {0, 0},
+		.extent = rtg.swapchain_extent,
+	};
 
-					assert(lines_vertices.size() == count);
-				}
+	if (target_aspect <= 0.0f) return;
 
-				{ //make some objects:
-					object_instances.clear();
+	float win_aspect = W / H;
 
-					{ //plane translated +x by one unit:
-						mat4 WORLD_FROM_LOCAL{
-							1.0f, 0.0f, 0.0f, 0.0f,
-							0.0f, 1.0f, 0.0f, 0.0f,
-							0.0f, 0.0f, 1.0f, 0.0f,
-							1.0f, 0.0f, 0.0f, 1.0f,
-						};
+	//If camera is wider than window => letterbox (bars top/bottom)
+	//If camera is taller than window => pillarbox (bars left/right)
+	if (target_aspect > win_aspect) {
+		//fit width
+		float newH = W / target_aspect;
+		float y0 = (H - newH) * 0.5f;
 
-						object_instances.emplace_back(ObjectInstance{
-							.vertices = plane_vertices,
-							.transform{
-								.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
-							},
-							.texture = 1,
-							});
-					}
-					{ //torus translated -x by one unit and rotated CCW around +y:
-						float ang = time / 60.0f * 2.0f * float(M_PI) * 10.0f;
-						float ca = std::cos(ang);
-						float sa = std::sin(ang);
-						mat4 WORLD_FROM_LOCAL{
-							  ca, 0.0f,  -sa, 0.0f,
-							0.0f, 1.0f, 0.0f, 0.0f,
-							  sa, 0.0f,   ca, 0.0f,
-							-1.0f,0.0f, 0.0f, 1.0f,
-						};
+		draw_viewport.y = y0;
+		draw_viewport.height = newH;
 
-						object_instances.emplace_back(ObjectInstance{
-							.vertices = torus_vertices,
-							.transform{
-								.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
-							},
-							});
-					}
+		draw_scissor.offset.y = int32_t(std::round(y0));
+		draw_scissor.extent.height = uint32_t(std::round(newH));
+	}
+	else {
+		//fit height
+		float newW = H * target_aspect;
+		float x0 = (W - newW) * 0.5f;
 
-					{ //chen parts near origin
-	// if she�s huge/small, scale here later
-						float s = 0.05f;
+		draw_viewport.x = x0;
+		draw_viewport.width = newW;
 
-						mat4 WORLD_FROM_LOCAL{
-							s,    0.0f, 0.0f, 0.0f,
-							0.0f, s,    0.0f, 0.0f,
-							0.0f, 0.0f, s,    0.0f,
-							0.0f, -0.5f, 0.0f, 1.0f,
-						};
+		draw_scissor.offset.x = int32_t(std::round(x0));
+		draw_scissor.extent.width = uint32_t(std::round(newW));
+	}
+}
 
 
+void Tutorial::update(float dt) {
+	//time += dt;
+	time = std::fmod(time + dt, 60.0f);
 
-						auto add_part = [&](ObjectVertices vr, uint32_t tex) {
-							object_instances.emplace_back(ObjectInstance{
-								.vertices = vr,
-								.transform{
-									.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
-									.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
-									.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
-								},
-								.texture = tex,
-								});
-							};
+	auto local_from_node = [&](S72::Node const& n) -> mat4 {
+		mat4 T = mat4_translate(n.translation.x, n.translation.y, n.translation.z);
+		mat4 R = mat4_from_quat(n.rotation.x, n.rotation.y, n.rotation.z, n.rotation.w);
+		mat4 S = mat4_scale(n.scale.x, n.scale.y, n.scale.z);
+		return mat4_mul(T, mat4_mul(R, S)); // TRS
+		};
 
-						add_part(chen_body_vertices, tex_body);
-						add_part(chen_clothes_vertices, tex_clothes);
-						add_part(chen_hairs_vertices, tex_hair);
-						add_part(chen_face_vertices, tex_face);
-						add_part(chen_iris_vertices, tex_iris);
+	auto world_from_node = [&](S72::Node const& n) -> mat4 {
+		// compute by walking parents using the node's .parent pointer if it exists.
+		// If Node doesn't have parent, we compute via recursion from roots (fallback below).
+		mat4 W = mat4_identity();
 
-						// optional:
-						add_part(chen_sword_vertices, tex_sword);
- 
-					}
+		// Fallback path: recompute from roots every time (fine for A1-show).
+		// We’ll do a quick DFS until we hit this node.
+		bool found = false;
+		std::function<void(S72::Node const&, mat4 const&)> find;
+		find = [&](S72::Node const& cur, mat4 const& parentW) {
+			if (found) return;
+			mat4 Wcur = mat4_mul(parentW, local_from_node(cur));
+			if (&cur == &n) {
+				W = Wcur;
+				found = true;
+				return;
+			}
+			for (S72::Node* ch : cur.children) if (ch) find(*ch, Wcur);
+			};
 
+		for (S72::Node* root : scene.scene.roots) if (root) find(*root, mat4_identity());
+		return W;
+		};
 
+	 
+
+	auto clip_from_orbit = [&](OrbitCamera const& cam) -> mat4 {
+		return perspective(
+			cam.fov,
+			rtg.swapchain_extent.width / float(rtg.swapchain_extent.height),
+			cam.near, cam.far
+		) * orbit(
+			cam.target_x, cam.target_y, cam.target_z,
+			cam.azimuth, cam.elevation, cam.radius
+		);
+		};
+
+	if (camera_mode == CameraMode::Scene) {
+		if (scene_camera_nodes.empty()) {
+			//no cameras in scene -> fall back to user camera, full screen
+			CLIP_FROM_WORLD = clip_from_orbit(free_camera);
+			CLIP_FROM_CULL = CLIP_FROM_WORLD;
+
+			scene_cam_aspect = 0.0f;
+			compute_letterbox(0.0f);
+		}
+		else {
+			active_scene_camera = std::min(active_scene_camera, uint32_t(scene_camera_nodes.size() - 1));
+			S72::Node const& cam_node = *scene_camera_nodes[active_scene_camera];
+
+			// Camera transform in world space:
+			mat4 WORLD_FROM_CAMERA = world_from_node(cam_node);
+
+			// View matrix:
+			mat4 CAMERA_FROM_WORLD = mat4_inverse_rigid(WORLD_FROM_CAMERA);
+
+			//--- pull camera params (fallback if missing):
+			float vfov = 60.0f * float(M_PI) / 180.0f;
+			float near_ = 0.1f;
+			float far_ = 1000.0f;
+			scene_cam_aspect = rtg.swapchain_extent.width / float(rtg.swapchain_extent.height);
+
+			if (cam_node.camera) {
+				//S72.hpp: camera->projection is std::variant< Perspective >
+				if (auto const* persp = std::get_if<S72::Camera::Perspective>(&cam_node.camera->projection)) {
+					vfov = persp->vfov;
+					near_ = persp->near;
+					far_ = persp->far;
+					if (persp->aspect > 0.0f) scene_cam_aspect = persp->aspect;
 				}
 			}
+
+			//optional safety clamp for far=infinity or weird values:
+			if (!std::isfinite(far_) || far_ <= near_) far_ = 1000.0f;
+
+			//letterbox based on camera aspect:
+			compute_letterbox(scene_cam_aspect);
+
+			CLIP_FROM_WORLD = perspective(vfov, scene_cam_aspect, near_, far_) * CAMERA_FROM_WORLD;
+			CLIP_FROM_CULL = CLIP_FROM_WORLD;
+		}
+	}
+	else if (camera_mode == CameraMode::User) {
+		CLIP_FROM_WORLD = clip_from_orbit(free_camera);
+		CLIP_FROM_CULL = CLIP_FROM_WORLD;
+
+		//full-screen viewport/scissor:
+		scene_cam_aspect = 0.0f;
+		compute_letterbox(0.0f);
+	}
+	else if (camera_mode == CameraMode::Debug) {
+		CLIP_FROM_WORLD = clip_from_orbit(debug_camera);
+
+		if (debug_cull_locked) CLIP_FROM_CULL = debug_locked_CLIP_FROM_CULL;
+		else CLIP_FROM_CULL = CLIP_FROM_WORLD;
+
+		//full-screen viewport/scissor:
+		scene_cam_aspect = 0.0f;
+		compute_letterbox(0.0f);
+	}
+
+
+
+	{ //static sun and sky:
+		world.SKY_DIRECTION.x = 0.0f;
+		world.SKY_DIRECTION.y = 0.0f;
+		world.SKY_DIRECTION.z = 1.0f;
+
+		world.SKY_ENERGY.r = 0.1f;
+		world.SKY_ENERGY.g = 0.1f;
+		world.SKY_ENERGY.b = 0.2f;
+
+		world.SUN_DIRECTION.x = 6.0f / 23.0f;
+		world.SUN_DIRECTION.y = 13.0f / 23.0f;
+		world.SUN_DIRECTION.z = 18.0f / 23.0f;
+
+		world.SUN_ENERGY.r = 1.0f;
+		world.SUN_ENERGY.g = 1.0f;
+		world.SUN_ENERGY.b = 0.9f;
+	}
+
+
+	//
+	//lines_vertices.reserve(4);
+	/* { //make some crossing lines at different depths:
+		lines_vertices.clear();
+
+
+		const int N = 60;
+		const float size = 1.0f;
+		const float step = (2.0f * size) / float(N);
+		size_t count = 4 * (N + 1) * N;
+		lines_vertices.reserve(count);
+
+
+		auto rippleY = [&](float x, float z) -> float {
+			float d = std::sqrt(x * x + z * z);
+			float y = std::sin(float(M_PI) * (4.0f * d - time));
+			y /= (1.0f + 10.0f * d);
+			return y;
+			};
+
+		// rows (z fixed, x changes)
+		for (int zi = 0; zi <= N; ++zi) {
+			float z = -size + zi * step;
+			for (int xi = 0; xi < N; ++xi) {
+				float x0 = -size + xi * step;
+				float x1 = x0 + step;
+
+				lines_vertices.emplace_back(PosColVertex{
+					.Position{.x = x0, .y = rippleY(x0, z), .z = z },
+					.Color{.r = 0xff, .g = 0xff, .b = 0x00, .a = 0xff }
+					});
+				lines_vertices.emplace_back(PosColVertex{
+					.Position{.x = x1, .y = rippleY(x1, z), .z = z },
+					.Color{.r = 0xff, .g = 0xff, .b = 0x00, .a = 0xff }
+					});
+			}
+		}
+
+		// columns (x fixed, z changes)
+		for (int xi = 0; xi <= N; ++xi) {
+			float x = -size + xi * step;
+			for (int zi = 0; zi < N; ++zi) {
+				float z0 = -size + zi * step;
+				float z1 = z0 + step;
+
+				lines_vertices.emplace_back(PosColVertex{
+					.Position{.x = x, .y = rippleY(x, z0), .z = z0 },
+					.Color{.r = 0x44, .g = 0x00, .b = 0xff, .a = 0xff }
+					});
+				lines_vertices.emplace_back(PosColVertex{
+					.Position{.x = x, .y = rippleY(x, z1), .z = z1 },
+					.Color{.r = 0x44, .g = 0x00, .b = 0xff, .a = 0xff }
+					});
+			}
+		}
+
+		assert(lines_vertices.size() == count);
+	}*/
+
+	{ //make some objects:
+		object_instances.clear();
+
+		if (!scene_file.empty()) {
+			// build instances from S72 scene nodes/meshes
+			auto local_from_node2 = [&](S72::Node const& n) -> mat4 {
+				mat4 T = mat4_translate(n.translation.x, n.translation.y, n.translation.z);
+				mat4 R = mat4_from_quat(n.rotation.x, n.rotation.y, n.rotation.z, n.rotation.w);
+				mat4 S = mat4_scale(n.scale.x, n.scale.y, n.scale.z);
+				return mat4_mul(T, mat4_mul(R, S));
+				};
+
+
+			std::function<void(S72::Node const&, mat4 const&)> emit_node;
+			emit_node = [&](S72::Node const& n, mat4 const& parent_world) {
+				mat4 WORLD_FROM_LOCAL = mat4_mul(parent_world, local_from_node2(n));
+
+
+				if (n.mesh) {
+					auto it = s72_mesh_to_range.find(n.mesh);
+					if (it != s72_mesh_to_range.end() && it->second.count > 0) {
+
+						// pick texture from mesh material (fallback to checker=0)
+						uint32_t tex = 0;
+						if (n.mesh->material) {
+							auto itM = material_to_texture.find(n.mesh->material);
+							if (itM != material_to_texture.end()) tex = itM->second;
+						}
+
+						object_instances.emplace_back(ObjectInstance{
+							.vertices = it->second,
+							.transform{
+								.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
+								.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
+								.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL, // good enough for now
+							},
+							.texture = tex,
+							});
+					}
+				}
+
+
+				for (S72::Node* child : n.children) {
+					if (child) emit_node(*child, WORLD_FROM_LOCAL);
+				}
+				};
+
+			mat4 I = mat4_identity();
+			for (S72::Node* root : scene.scene.roots) {
+				if (root) emit_node(*root, I);
+			}
+			
+
+		}
+		else {
+			//fallback: old hardcoded objects (optional)
+			// (you can keep this branch if you want a non-scene demo mode)
+			{ //plane translated +x by one unit:
+				mat4 WORLD_FROM_LOCAL{
+					1.0f, 0.0f, 0.0f, 0.0f,
+					0.0f, 1.0f, 0.0f, 0.0f,
+					0.0f, 0.0f, 1.0f, 0.0f,
+					1.0f, 0.0f, 0.0f, 1.0f,
+				};
+
+				object_instances.emplace_back(ObjectInstance{
+					.vertices = plane_vertices,
+					.transform{
+						.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
+						.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
+						.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
+					},
+					.texture = 1,
+					});
+			}
+			{ //torus translated -x by one unit and rotated CCW around +y:
+				float ang = time / 60.0f * 2.0f * float(M_PI) * 10.0f;
+				float ca = std::cos(ang);
+				float sa = std::sin(ang);
+				mat4 WORLD_FROM_LOCAL{
+					  ca, 0.0f,  -sa, 0.0f,
+					0.0f, 1.0f, 0.0f, 0.0f,
+					  sa, 0.0f,   ca, 0.0f,
+					-1.0f,0.0f, 0.0f, 1.0f,
+				};
+
+				object_instances.emplace_back(ObjectInstance{
+					.vertices = torus_vertices,
+					.transform{
+						.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
+						.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
+						.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
+					},
+					});
+			}
+
+			{ //chen parts near origin
+// if she’s huge/small, scale here later
+				float s = 0.05f;
+
+				mat4 WORLD_FROM_LOCAL{
+					s,    0.0f, 0.0f, 0.0f,
+					0.0f, s,    0.0f, 0.0f,
+					0.0f, 0.0f, s,    0.0f,
+					0.0f, -0.5f, 0.0f, 1.0f,
+				};
+
+
+
+				auto add_part = [&](ObjectVertices vr, uint32_t tex) {
+					object_instances.emplace_back(ObjectInstance{
+						.vertices = vr,
+						.transform{
+							.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
+							.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
+							.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
+						},
+						.texture = tex,
+						});
+					};
+
+				add_part(chen_body_vertices, tex_body);
+				add_part(chen_clothes_vertices, tex_clothes);
+				add_part(chen_hairs_vertices, tex_hair);
+				add_part(chen_face_vertices, tex_face);
+				add_part(chen_iris_vertices, tex_iris);
+
+				// optional:
+				add_part(chen_sword_vertices, tex_sword);
+
+			}
+
+
+		
+		}
+	}
+}
 void Tutorial::on_input(InputEvent const &evt) {
 	//if there is a current action, it gets input priority:
 	if (action) {
@@ -1559,20 +2167,51 @@ void Tutorial::on_input(InputEvent const &evt) {
 
 	//general controls:
 	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_TAB) {
-		//switch camera modes
-		camera_mode = CameraMode((int(camera_mode) + 1) % 2);
+		CameraMode prev = camera_mode;
+		camera_mode = CameraMode((int(camera_mode) + 1) % 3);
+
+		// if we are ENTERING debug, lock cull camera to whatever it was
+		if (camera_mode == CameraMode::Debug && prev != CameraMode::Debug) {
+			debug_cull_locked = true;
+			debug_locked_CLIP_FROM_CULL = CLIP_FROM_CULL; // from last update()
+		}
+
+		// if we are LEAVING debug, unlock
+		if (prev == CameraMode::Debug && camera_mode != CameraMode::Debug) {
+			debug_cull_locked = false;
+		}
+		if (camera_mode == CameraMode::Scene) std::cout << "[A1-show] camera mode: Scene\n";
+		if (camera_mode == CameraMode::User)  std::cout << "[A1-show] camera mode: User\n";
+		if (camera_mode == CameraMode::Debug) std::cout << "[A1-show] camera mode: Debug\n";
+
 		return;
 	}
-	//free camera controls
-	if (camera_mode == CameraMode::Free) { //This camera move is a "dolly" not a "zoom" because 
+
+
+	// cycle scene cameras (only when in scene mode):
+	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_C) {
+		if (camera_mode == CameraMode::Scene && !scene_camera_nodes.empty()) {
+			active_scene_camera = (active_scene_camera + 1) % uint32_t(scene_camera_nodes.size());
+			std::cout << "[A1-show] active scene camera: " << active_scene_camera << " / " << scene_camera_nodes.size() << "\n";
+		}
+		return;
+	}
+
+	
+	// user/debug orbit controls
+	if (camera_mode == CameraMode::User || camera_mode == CameraMode::Debug) {
+		//free camera controls
+		OrbitCamera& cam = (camera_mode == CameraMode::Debug ? debug_camera : free_camera);
+
+		//This camera move is a "dolly" not a "zoom" because 
 		//we're moving the camera's position, not changing its field of view.
 
 		if (evt.type == InputEvent::MouseWheel) {
 			//change distance by 10% every scroll click:
-			free_camera.radius *= std::exp(std::log(1.1f) * -evt.wheel.y);
+			cam.radius *= std::exp(std::log(1.1f) * -evt.wheel.y);
 			//make sure camera isn't too close or too far from target:
-			free_camera.radius = std::max(free_camera.radius, 0.5f * free_camera.near);
-			free_camera.radius = std::min(free_camera.radius, 2.0f * free_camera.far);
+			cam.radius = std::max(cam.radius, 0.5f * cam.near);
+			cam.radius = std::min(cam.radius, 2.0f * cam.far);
 			return;
 		}
 
@@ -1581,24 +2220,21 @@ void Tutorial::on_input(InputEvent const &evt) {
 			//start panning
 			float init_x = evt.button.x;
 			float init_y = evt.button.y;
-			OrbitCamera init_camera = free_camera;
+			OrbitCamera init_camera = cam;
 
-			action = [this, init_x, init_y, init_camera](InputEvent const& evt) {
+			action = [this, init_x, init_y, init_camera, &cam](InputEvent const& evt) {
 				if (evt.type == InputEvent::MouseButtonUp && evt.button.button == GLFW_MOUSE_BUTTON_LEFT) {
 					//cancel upon button lifted:
 					action = nullptr;
 					return;
 				}
 				if (evt.type == InputEvent::MouseMotion) {
-					//handle motion
-
 					//image height at plane of target point:
-					float height = 2.0f * std::tan(free_camera.fov * 0.5f) * free_camera.radius;
+					float height = 2.0f * std::tan(init_camera.fov * 0.5f) * init_camera.radius;
 
 					//motion, therefore, at target point:
 					float dx = (evt.motion.x - init_x) / rtg.swapchain_extent.height * height;
-					float dy = (evt.motion.y - init_y) / rtg.swapchain_extent.height * height; //note: nega
-					//ted because glfw uses y-down coordinate system
+					float dy = (evt.motion.y - init_y) / rtg.swapchain_extent.height * height; //note: negated because glfw uses y-down
 
 					//compute camera transform to extract right (first row) and up (second row):
 					mat4 camera_from_world = orbit(
@@ -1607,18 +2243,19 @@ void Tutorial::on_input(InputEvent const &evt) {
 					);
 
 					//move the desired distance:
-					free_camera.target_x = init_camera.target_x - dx * camera_from_world[0] - dy * 
-						camera_from_world[1];
-					free_camera.target_y = init_camera.target_y- dx * camera_from_world[4] - dy * 
-						camera_from_world[5];
-					free_camera.target_z = init_camera.target_z - dx * camera_from_world[8] - dy * 
-						camera_from_world[9];
+					cam.target_x = init_camera.target_x - dx * camera_from_world[0] - dy * camera_from_world[1];
+					cam.target_y = init_camera.target_y - dx * camera_from_world[4] - dy * camera_from_world[5];
+					cam.target_z = init_camera.target_z - dx * camera_from_world[8] - dy * camera_from_world[9];
 
 					return;
 				}
 			};
 			return;
 		}
+
+		 
+	
+
 
 		if (evt.type == InputEvent::MouseButtonDown && evt.button.button == GLFW_MOUSE_BUTTON_LEFT) {
 			//start tumbling

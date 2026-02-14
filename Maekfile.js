@@ -99,7 +99,8 @@ function custom_flags_and_rules() {
 		maek.options.CPPFlags = [
 			'-O2',
 			`-I${VULKAN_SDK}/include`,
-			`-I${GLFW_DIR}/include`
+			`-I${GLFW_DIR}/include`,
+			`-Iexternal/s72`,
 		];
 
 		maek.options.LINKLibs = [
@@ -109,7 +110,7 @@ function custom_flags_and_rules() {
 			`-L${GLFW_DIR}/lib`,
 			'-lX11',
 			`-lglfw3`,
-			`-Iexternal/s72`,
+			
 
 		];
 

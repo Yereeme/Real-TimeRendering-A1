@@ -5,6 +5,7 @@
 #include "mat4.hpp"
 #include <string>
 
+#include "S72.hpp"
 #include "RTG.hpp"
 #include <unordered_map>
 
@@ -18,6 +19,11 @@ struct Tutorial : RTG::Application {
 	//kept for use in destructor:
 	RTG &rtg;
 	std::string scene_file;
+	S72 scene; //loaded s72 scene graph  
+	bool use_s72_scene = true;
+ 
+
+
 	//--------------------------------------------------------------------
 	//Resources that last the lifetime of the application:
 
@@ -148,12 +154,20 @@ struct Tutorial : RTG::Application {
 	//static scene resources:
 
 	Helpers::AllocatedBuffer object_vertices;
+
+	
+
 	//store the index of the first vertex and the count of vertices (parameters used by vkCmdDraw) for each 
 	//mesh stored in obj vertices arraay
 	struct ObjectVertices {
 		uint32_t first = 0;
 		uint32_t count = 0;
 	};
+
+	//--- S72 packed mesh ranges (one entry per scene.meshes[i]):
+	std::vector< ObjectVertices > s72_mesh_vertices;
+	std::unordered_map<S72::Mesh const*, ObjectVertices> s72_mesh_to_range;
+
 	ObjectVertices plane_vertices;
 	ObjectVertices torus_vertices;
 	ObjectVertices crystal_vertices;
@@ -173,6 +187,9 @@ struct Tutorial : RTG::Application {
 	std::vector< VkDescriptorSet > texture_descriptors; //allocated from texture_descriptor_pool
 	//maps a loaded material texture to our textures[] index:
 	std::unordered_map<std::string, uint32_t> texture_lookup;//cpu side metadata
+	std::unordered_map< S72::Material const*, uint32_t > material_to_texture;
+	std::unordered_map< std::string, uint32_t > s72_texture_path_to_index; // cache
+
 	uint32_t tex_body = 0;
 	uint32_t tex_clothes = 0;
 	uint32_t tex_hair = 0;
@@ -204,7 +221,7 @@ struct Tutorial : RTG::Application {
 	float time = 0.0f;
 
 	struct OrbitCamera {
-		float target_x = 20.5f, target_y = 0.0f, target_z = 0.0f; //where the camera is 
+		float target_x = 0.0f, target_y = 0.0f, target_z = 0.0f; //where the camera is 
 		//looking + orbiting
 		float radius = 2.0f; //distance from camera to target
 		float azimuth = 0.0f; //counterclockwise angle around z axis between x axis and camera direction
@@ -219,8 +236,33 @@ struct Tutorial : RTG::Application {
 	//for selecting between cameras:
 	enum class CameraMode {
 		Scene = 0,
-		Free = 1,
-	} camera_mode = CameraMode::Free;
+		User = 1,
+		Debug = 2,
+	} camera_mode = CameraMode::User;
+
+	//render-time viewport/scissor (computed in update, applied in render)
+	VkViewport draw_viewport{};
+	VkRect2D   draw_scissor{};
+
+	//scene camera aspect (used to letterbox/pillarbox)
+	float scene_cam_aspect = 0.0f; //fullscreen
+
+	void compute_letterbox(float target_aspect);
+
+
+
+	// Scene camera list (nodes that have a camera attached):
+	std::vector<S72::Node const*> scene_camera_nodes;
+	uint32_t active_scene_camera = 0;
+
+	// second user-controlled camera for debug mode:
+	OrbitCamera debug_camera;
+
+	// store the culling camera matrix
+	mat4 CLIP_FROM_CULL = mat4{}; // set every update
+	bool debug_cull_locked = false;
+	mat4 debug_locked_CLIP_FROM_CULL = mat4{};
+
 
 	//computed from the current camera (as set by camera_mode) during update():
 	mat4 CLIP_FROM_WORLD; //matrix through which to view grid line
