@@ -62,6 +62,11 @@ struct RTG {
 		//'--scene command line flag'
 		std::string scene_file = "";
 
+		//'--camera command line flag'
+		std::optional<std::string> camera; // "scene" | "user" | "debug"
+
+		std::optional<std::string> camera_name;
+
 
 		//requested (priority-ranked) formats for output surface: (will use first available)
 		std::vector< VkSurfaceFormatKHR > surface_formats{
@@ -87,6 +92,10 @@ struct RTG {
 		Configuration() = default;
 		void parse(int argc, char **argv); //parse command-line options; throws on error
 		static void usage(std::function< void(const char *, const char *) > const &callback); //reports command line usage by passing flag and description to callback.
+
+		//culling mode requested at startup (A1-cull)
+		enum class CullingMode { None, Frustum };
+		CullingMode culling = CullingMode::None;
 	};
 
 	Configuration configuration; //configuration, as used (might have extra extensions, layers, or flags added)

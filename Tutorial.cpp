@@ -25,7 +25,11 @@
 static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*>& out);
 
 
-Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene_file(scene_file_) {
+Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_, RTG::Configuration::CullingMode culling_mode_) : rtg(rtg_), scene_file(scene_file_) {
+
+	culling_mode = culling_mode_;
+	enable_culling = (culling_mode_ == RTG::Configuration::CullingMode::Frustum);
+
 
 	use_s72_scene = !scene_file_.empty();
 	if (use_s72_scene) {
@@ -54,7 +58,69 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 		debug_camera = free_camera;
 	}
 
+	// --- enforce --camera <name> requirement :
+	if (rtg.configuration.camera_name.has_value() && !rtg.configuration.camera_name->empty()) {
+		const std::string& requested = *rtg.configuration.camera_name;
+		 
+		if (!use_s72_scene) {
+			throw std::runtime_error("--camera was provided, but no scene file was loaded.");
+		}
 
+		if (scene_camera_nodes.empty()) {
+			throw std::runtime_error("--camera was provided, but the scene contains no cameras.");
+		}
+
+		camera_mode = CameraMode::Scene;
+
+		bool found = false;
+		for (uint32_t i = 0; i < uint32_t(scene_camera_nodes.size()); ++i) {
+			S72::Node const& n = *scene_camera_nodes[i];
+
+
+			std::string node_name;
+			std::string camera_name;
+
+			// If Node has .name:
+			if constexpr (requires { n.name; }) {
+				node_name = n.name;
+			}
+
+			// If camera exists and has .name:
+			if (n.camera) {
+				if constexpr (requires { n.camera->name; }) {
+					camera_name = n.camera->name;
+				}
+			}
+
+			if (node_name == rtg.configuration.camera_name || camera_name == rtg.configuration.camera_name) {
+				active_scene_camera = i;
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			// optional: print available camera names to help debugging
+			std::string available;
+			for (S72::Node const* p : scene_camera_nodes) {
+				if (!p) continue;
+				if constexpr (requires { p->name; }) {
+					available += "  - " + p->name + "\n";
+				}
+				else {
+					available += "  - (unnamed)\n";
+				}
+			}
+
+			throw std::runtime_error(
+				"No camera named '" + requested + "' in scene.\n"
+				"Available cameras:\n" + available
+			);
+		}
+	}
+
+		
+	
 	
 
 	 
@@ -77,7 +143,7 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, //LAYOUT IMAGE TRANSITIONED TO BEFORE THE LOAD
-				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, //layout image is transitioned to after the store
+				.finalLayout = rtg.present_layout, //layout image is transitioned to after the store
 			     
 			},
 			VkAttachmentDescription{ //1 - depth attachment:
@@ -126,7 +192,7 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 				VkSubpassDependency{
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.dstSubpass = 0,
-				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.srcAccessMask = 0,
 				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -452,7 +518,18 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 
 		auto emit_vertex = [&](uint32_t vtx_index) {
 			size_t pos_off = size_t(posA->offset) + size_t(vtx_index) * size_t(posA->stride);
-			S72::vec3 p = read_vec3_f32(posBytes, pos_off);
+			S72::vec3 p = read_vec3_f32(posBytes, pos_off); //read positions
+
+			//AABB accumulate (local space):update bounds
+			range.local_min.x = std::min(range.local_min.x, p.x);
+			range.local_min.y = std::min(range.local_min.y, p.y);
+			range.local_min.z = std::min(range.local_min.z, p.z);
+
+			range.local_max.x = std::max(range.local_max.x, p.x);
+			range.local_max.y = std::max(range.local_max.y, p.y);
+			range.local_max.z = std::max(range.local_max.z, p.z);
+
+			 
 
 			S72::vec3 n{ 0.0f, 0.0f, 1.0f };
 			if (norA && norBytes) {
@@ -468,6 +545,7 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_) : rtg(rtg_), scene
 				t = 1.0f - uv.second; // flip V like you already do
 			}
 
+			// normals/uv
 			packed.emplace_back(PosNorTexVertex{
 				.Position{.x = p.x, .y = p.y, .z = p.z },
 				.Normal  {.x = n.x, .y = n.y, .z = n.z },
@@ -1540,53 +1618,37 @@ void Tutorial::render(RTG& rtg_, RTG::RenderParams const& render_params) {
 			vkCmdSetViewport(workspace.command_buffer, 0, 1, &draw_viewport);
 		}
 
-		{//draw with background pipeline:
-			vkCmdBindPipeline(workspace.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-				background_pipeline.handle);
+		// draw with the lines pipeline (only once, and only when we have lines)
+		if (!lines_vertices.empty()) {
+			// we should have allocated a buffer in the upload path
+			assert(workspace.lines_vertices.handle != VK_NULL_HANDLE);
 
-			{//push time:
-				BackgroundPipeline::Push push{
-					.time = time,
-				};
-				vkCmdPushConstants(workspace.command_buffer, background_pipeline.layout,
-					VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-			}
-			vkCmdDraw(workspace.command_buffer, 3, 1, 0, 0);
-		}
-
-		{ //draw with the lines pipeline:
 			vkCmdBindPipeline(workspace.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, lines_pipeline.handle);
-			{ //use lines_vertices (offset 0) as vertex buffer binding 0:
 
-				std::array< VkBuffer, 1> vertex_buffers{ workspace.lines_vertices.handle };
-				std::array< VkDeviceSize, 1> offsets{ 0 };
-				vkCmdBindVertexBuffers(workspace.command_buffer, 0, uint32_t(vertex_buffers.size()), vertex_buffers.
-					data(), offsets.data());
-
+			// use lines_vertices (offset 0) as vertex buffer binding 0:
+			{
+				VkBuffer vb = workspace.lines_vertices.handle;
+				VkDeviceSize off = 0;
+				vkCmdBindVertexBuffers(workspace.command_buffer, 0, 1, &vb, &off);
 			}
 
-			{//bind Camera descriptor set:
-				std::array< VkDescriptorSet, 1 > descriptor_sets{
-					workspace.Camera_descriptors, //0: Camera
-				};
+			// bind Camera descriptor set:
+			{
+				VkDescriptorSet set0 = workspace.Camera_descriptors;
 				vkCmdBindDescriptorSets(
-					workspace.command_buffer, //command buffer
-					VK_PIPELINE_BIND_POINT_GRAPHICS, //pipeline bind point
-					lines_pipeline.layout, //pipeline layout
-					0, //first set
-					//uint32_t(descriptor_sets.size())
-					1, descriptor_sets.data(), //descriptor sets
-					//count, ptr
-					0, nullptr //dynamic offsets count, ptr
+					workspace.command_buffer,
+					VK_PIPELINE_BIND_POINT_GRAPHICS,
+					lines_pipeline.layout,
+					0,
+					1, &set0,
+					0, nullptr
 				);
 			}
 
-			 
-
-			//draw lines vertices:
+			// draw lines vertices:
 			vkCmdDraw(workspace.command_buffer, uint32_t(lines_vertices.size()), 1, 0, 0);
-
 		}
+
 
 		{//draw with object pipeline
 			if (!object_instances.empty()) { //draw with the objects pipeline:
@@ -1763,6 +1825,136 @@ static mat4 mat4_inverse_rigid(mat4 const& M) {
 	};
 }
 
+static mat4 mat4_inverse(mat4 const& m) {
+	// general 4x4 inverse (column-major)
+	float inv[16];
+
+	inv[0] = m[5] * m[10] * m[15] -
+		m[5] * m[11] * m[14] -
+		m[9] * m[6] * m[15] +
+		m[9] * m[7] * m[14] +
+		m[13] * m[6] * m[11] -
+		m[13] * m[7] * m[10];
+
+	inv[4] = -m[4] * m[10] * m[15] +
+		m[4] * m[11] * m[14] +
+		m[8] * m[6] * m[15] -
+		m[8] * m[7] * m[14] -
+		m[12] * m[6] * m[11] +
+		m[12] * m[7] * m[10];
+
+	inv[8] = m[4] * m[9] * m[15] -
+		m[4] * m[11] * m[13] -
+		m[8] * m[5] * m[15] +
+		m[8] * m[7] * m[13] +
+		m[12] * m[5] * m[11] -
+		m[12] * m[7] * m[9];
+
+	inv[12] = -m[4] * m[9] * m[14] +
+		m[4] * m[10] * m[13] +
+		m[8] * m[5] * m[14] -
+		m[8] * m[6] * m[13] -
+		m[12] * m[5] * m[10] +
+		m[12] * m[6] * m[9];
+
+	inv[1] = -m[1] * m[10] * m[15] +
+		m[1] * m[11] * m[14] +
+		m[9] * m[2] * m[15] -
+		m[9] * m[3] * m[14] -
+		m[13] * m[2] * m[11] +
+		m[13] * m[3] * m[10];
+
+	inv[5] = m[0] * m[10] * m[15] -
+		m[0] * m[11] * m[14] -
+		m[8] * m[2] * m[15] +
+		m[8] * m[3] * m[14] +
+		m[12] * m[2] * m[11] -
+		m[12] * m[3] * m[10];
+
+	inv[9] = -m[0] * m[9] * m[15] +
+		m[0] * m[11] * m[13] +
+		m[8] * m[1] * m[15] -
+		m[8] * m[3] * m[13] -
+		m[12] * m[1] * m[11] +
+		m[12] * m[3] * m[9];
+
+	inv[13] = m[0] * m[9] * m[14] -
+		m[0] * m[10] * m[13] -
+		m[8] * m[1] * m[14] +
+		m[8] * m[2] * m[13] +
+		m[12] * m[1] * m[10] -
+		m[12] * m[2] * m[9];
+
+	inv[2] = m[1] * m[6] * m[15] -
+		m[1] * m[7] * m[14] -
+		m[5] * m[2] * m[15] +
+		m[5] * m[3] * m[14] +
+		m[13] * m[2] * m[7] -
+		m[13] * m[3] * m[6];
+
+	inv[6] = -m[0] * m[6] * m[15] +
+		m[0] * m[7] * m[14] +
+		m[4] * m[2] * m[15] -
+		m[4] * m[3] * m[14] -
+		m[12] * m[2] * m[7] +
+		m[12] * m[3] * m[6];
+
+	inv[10] = m[0] * m[5] * m[15] -
+		m[0] * m[7] * m[13] -
+		m[4] * m[1] * m[15] +
+		m[4] * m[3] * m[13] +
+		m[12] * m[1] * m[7] -
+		m[12] * m[3] * m[5];
+
+	inv[14] = -m[0] * m[5] * m[14] +
+		m[0] * m[6] * m[13] +
+		m[4] * m[1] * m[14] -
+		m[4] * m[2] * m[13] -
+		m[12] * m[1] * m[6] +
+		m[12] * m[2] * m[5];
+
+	inv[3] = -m[1] * m[6] * m[11] +
+		m[1] * m[7] * m[10] +
+		m[5] * m[2] * m[11] -
+		m[5] * m[3] * m[10] -
+		m[9] * m[2] * m[7] +
+		m[9] * m[3] * m[6];
+
+	inv[7] = m[0] * m[6] * m[11] -
+		m[0] * m[7] * m[10] -
+		m[4] * m[2] * m[11] +
+		m[4] * m[3] * m[10] +
+		m[8] * m[2] * m[7] -
+		m[8] * m[3] * m[6];
+
+	inv[11] = -m[0] * m[5] * m[11] +
+		m[0] * m[7] * m[9] +
+		m[4] * m[1] * m[11] -
+		m[4] * m[3] * m[9] -
+		m[8] * m[1] * m[7] +
+		m[8] * m[3] * m[5];
+
+	inv[15] = m[0] * m[5] * m[10] -
+		m[0] * m[6] * m[9] -
+		m[4] * m[1] * m[10] +
+		m[4] * m[2] * m[9] +
+		m[8] * m[1] * m[6] -
+		m[8] * m[2] * m[5];
+
+	float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+
+	if (std::fabs(det) < 1e-9f) {
+		// not invertible; return identity as a safe fallback
+		return mat4_identity();
+	}
+
+	float invDet = 1.0f / det;
+
+	mat4 out{};
+	for (int i = 0; i < 16; i++) out[i] = inv[i] * invDet;
+	return out;
+}
+
 static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*>& out) {
 	out.clear();
 
@@ -1778,6 +1970,227 @@ static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*
 		if (root) walk(*root);
 	}
 }
+
+
+
+struct Vec4 { float x, y, z, w; };
+
+static Vec4 mul(mat4 const& M, float x, float y, float z, float w) {
+	// mat4 is column-major, and multiply like CLIP_FROM_WORLD * WORLD_FROM_LOCAL
+	 
+	Vec4 r;
+	r.x = M[0] * x + M[4] * y + M[8] * z + M[12] * w;
+	r.y = M[1] * x + M[5] * y + M[9] * z + M[13] * w;
+	r.z = M[2] * x + M[6] * y + M[10] * z + M[14] * w;
+	r.w = M[3] * x + M[7] * y + M[11] * z + M[15] * w;
+	return r;
+}
+
+static bool aabb_is_culled_in_clip( //https://ktstephano.github.io/rendering/stratusgfx/aabbs helped a lot
+	//extract the 8 transformed corners of the box using min/max
+	mat4 const& CLIP_FROM_LOCAL,
+	float minx, float miny, float minz,
+	float maxx, float maxy, float maxz
+) {
+	// 8 corners in local space:
+	float cx[8] = { minx, maxx, minx, maxx, minx, maxx, minx, maxx };
+	float cy[8] = { miny, miny, maxy, maxy, miny, miny, maxy, maxy };
+	float cz[8] = { minz, minz, minz, minz, maxz, maxz, maxz, maxz };
+
+	// For each plane, if all corners are outside -> cull:
+	int out;
+
+	// left: x < -w
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.x < -p.w) out++;
+	}
+	if (out == 8) return true;
+
+	// right: x > w
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.x > p.w) out++;
+	}
+	if (out == 8) return true;
+
+	// bottom: y < -w
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.y < -p.w) out++;
+	}
+	if (out == 8) return true;
+
+	// top: y > w
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.y > p.w) out++;
+	}
+	if (out == 8) return true;
+
+	// near (Vulkan): z < 0
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.z < 0.0f) out++;
+	}
+	if (out == 8) return true;
+
+	// far: z > w
+	out = 0;
+	for (int i = 0;i < 8;i++) {
+		Vec4 p = mul(CLIP_FROM_LOCAL, cx[i], cy[i], cz[i], 1.0f);
+		if (p.z > p.w) out++;
+	}
+	if (out == 8) return true;
+
+	return false; // not fully outside any plane -> keep
+}
+
+static void add_aabb_lines( //heavily based on https://ktstephano.github.io/rendering/stratusgfx/aabbs
+	std::vector<PosColVertex>& out,
+	mat4 const& WORLD_FROM_LOCAL,
+	S72::vec3 const& local_min,
+	S72::vec3 const& local_max,
+	uint8_t r, uint8_t g, uint8_t b, uint8_t a = 0xff
+) {
+	auto xform = [&](float x, float y, float z) -> S72::vec3 {
+		Vec4 p = mul(WORLD_FROM_LOCAL, x, y, z, 1.0f);
+		return S72::vec3{ p.x, p.y, p.z };
+		};
+
+	//create the 8 corners
+	S72::vec3 c[8];
+	c[0] = xform(local_min.x, local_min.y, local_min.z);
+	c[1] = xform(local_max.x, local_min.y, local_min.z);
+	c[2] = xform(local_min.x, local_max.y, local_min.z);
+	c[3] = xform(local_max.x, local_max.y, local_min.z);
+	c[4] = xform(local_min.x, local_min.y, local_max.z);
+	c[5] = xform(local_max.x, local_min.y, local_max.z);
+	c[6] = xform(local_min.x, local_max.y, local_max.z);
+	c[7] = xform(local_max.x, local_max.y, local_max.z);
+
+	auto push_seg = [&](int i0, int i1) { //drawing help
+		out.emplace_back(PosColVertex{
+			.Position{.x = c[i0].x, .y = c[i0].y, .z = c[i0].z },
+			.Color{.r = r, .g = g, .b = b, .a = a }
+			});
+		out.emplace_back(PosColVertex{
+			.Position{.x = c[i1].x, .y = c[i1].y, .z = c[i1].z },
+			.Color{.r = r, .g = g, .b = b, .a = a }
+			});
+		};
+
+	// connect the corners to form 12 lines
+	push_seg(0, 1); push_seg(1, 3); push_seg(3, 2); push_seg(2, 0);
+	push_seg(4, 5); push_seg(5, 7); push_seg(7, 6); push_seg(6, 4);
+	push_seg(0, 4); push_seg(1, 5); push_seg(2, 6); push_seg(3, 7);
+}
+
+static S72::vec3 clip_to_world(mat4 const& WORLD_FROM_CLIP, float x, float y, float z) {
+	Vec4 p = mul(WORLD_FROM_CLIP, x, y, z, 1.0f);
+	float iw = (p.w != 0.0f) ? (1.0f / p.w) : 0.0f;
+	return S72::vec3{ p.x * iw, p.y * iw, p.z * iw };
+}
+
+static void add_line(
+	std::vector<PosColVertex>& out,
+	S72::vec3 a, S72::vec3 b,
+	uint8_t r, uint8_t g, uint8_t bb, uint8_t a8 = 0xff
+) {
+	out.emplace_back(PosColVertex{
+		.Position{.x = a.x, .y = a.y, .z = a.z},
+		.Color{.r = r, .g = g, .b = bb, .a = a8}
+		});
+	out.emplace_back(PosColVertex{
+		.Position{.x = b.x, .y = b.y, .z = b.z},
+		.Color{.r = r, .g = g, .b = bb, .a = a8}
+		});
+}
+
+static void add_frustum_lines_from_clip(
+	std::vector<PosColVertex>& out,
+	mat4 const& CLIP_FROM_WORLD,
+	uint8_t r, uint8_t g, uint8_t b, uint8_t a = 0xff
+) {
+	mat4 WORLD_FROM_CLIP = mat4_inverse(CLIP_FROM_WORLD);
+
+	// Vulkan NDC: x,y in [-1,1], z in [0,1]
+	S72::vec3 n0 = clip_to_world(WORLD_FROM_CLIP, -1, -1, 0);
+	S72::vec3 n1 = clip_to_world(WORLD_FROM_CLIP, 1, -1, 0);
+	S72::vec3 n2 = clip_to_world(WORLD_FROM_CLIP, -1, 1, 0);
+	S72::vec3 n3 = clip_to_world(WORLD_FROM_CLIP, 1, 1, 0);
+
+	S72::vec3 f0 = clip_to_world(WORLD_FROM_CLIP, -1, -1, 1);
+	S72::vec3 f1 = clip_to_world(WORLD_FROM_CLIP, 1, -1, 1);
+	S72::vec3 f2 = clip_to_world(WORLD_FROM_CLIP, -1, 1, 1);
+	S72::vec3 f3 = clip_to_world(WORLD_FROM_CLIP, 1, 1, 1);
+
+	// near rect
+	add_line(out, n0, n1, r, g, b, a);
+	add_line(out, n1, n3, r, g, b, a);
+	add_line(out, n3, n2, r, g, b, a);
+	add_line(out, n2, n0, r, g, b, a);
+
+	// far rect
+	add_line(out, f0, f1, r, g, b, a);
+	add_line(out, f1, f3, r, g, b, a);
+	add_line(out, f3, f2, r, g, b, a);
+	add_line(out, f2, f0, r, g, b, a);
+
+	// sides
+	add_line(out, n0, f0, r, g, b, a);
+	add_line(out, n1, f1, r, g, b, a);
+	add_line(out, n2, f2, r, g, b, a);
+	add_line(out, n3, f3, r, g, b, a);
+}
+
+static void apply_drivers(S72& s72, float t) {
+	for (auto& drv : s72.drivers) {
+		// 1) find keyframe interval
+		auto const& times = drv.times;
+		auto const& vals = drv.values;
+		if (times.empty()) continue;
+
+		size_t i = 0;
+		if (t <= times.front()) {
+			i = 0;
+		}
+		else if (t >= times.back()) {
+			i = times.size() - 1;
+		}
+		else {
+			// find i such that times[i] <= t < times[i+1]
+			while (i + 1 < times.size() && !(times[i] <= t && t < times[i + 1])) ++i;
+		}
+
+		// helper lambdas to read key values:
+		auto read_vec3 = [&](size_t key)->S72::vec3 {
+			size_t base = key * 3;
+			return S72::vec3{ vals[base + 0], vals[base + 1], vals[base + 2] };
+			};
+		auto read_quat = [&](size_t key)->S72::quat {
+			size_t base = key * 4;
+			return S72::quat{ vals[base + 0], vals[base + 1], vals[base + 2], vals[base + 3] };
+			};
+
+		// 2) apply (start with STEP ONLY to get moving fast)
+		if (drv.channel == S72::Driver::Channel::translation) {
+			drv.node.translation = read_vec3(i);
+		}
+		else if (drv.channel == S72::Driver::Channel::scale) {
+			drv.node.scale = read_vec3(i);
+		}
+		else { // rotation
+			drv.node.rotation = read_quat(i);
+		}
+	}
+}
+
 
 void Tutorial::compute_letterbox(float target_aspect) {
 	//target_aspect == 0 => full screen
@@ -1829,9 +2242,33 @@ void Tutorial::compute_letterbox(float target_aspect) {
 }
 
 
+
 void Tutorial::update(float dt) {
+
+	if (forced_camera.has_value()) {
+		camera_mode = forced_camera.value();
+	}
+
+
 	//time += dt;
 	time = std::fmod(time + dt, 60.0f);
+
+	//advance and apply animation driver
+	if (use_s72_scene) {
+		if (!anim_paused) anim_time += dt;
+		apply_drivers(scene, anim_time);
+	}
+
+	if (use_s72_scene) {
+		if (!anim_started) {
+			anim_time = 0.0f;        // first rendered frame at 0
+			anim_started = true;
+		}
+		else if (!anim_paused) {
+			anim_time += dt;         // advance after first frame
+		}
+		apply_drivers(scene, anim_time);
+	}
 
 	auto local_from_node = [&](S72::Node const& n) -> mat4 {
 		mat4 T = mat4_translate(n.translation.x, n.translation.y, n.translation.z);
@@ -1896,6 +2333,7 @@ void Tutorial::update(float dt) {
 			// View matrix:
 			mat4 CAMERA_FROM_WORLD = mat4_inverse_rigid(WORLD_FROM_CAMERA);
 
+
 			//--- pull camera params (fallback if missing):
 			float vfov = 60.0f * float(M_PI) / 180.0f;
 			float near_ = 0.1f;
@@ -1940,6 +2378,9 @@ void Tutorial::update(float dt) {
 		scene_cam_aspect = 0.0f;
 		compute_letterbox(0.0f);
 	}
+
+	 
+
 
 
 
@@ -2020,6 +2461,13 @@ void Tutorial::update(float dt) {
 
 		assert(lines_vertices.size() == count);
 	}*/
+	lines_vertices.clear();
+	lines_vertices.reserve(100000); // 
+
+	if (camera_mode == CameraMode::Debug) {
+		// Draw the culling frustum (from the locked/previous camera)
+		add_frustum_lines_from_clip(lines_vertices, CLIP_FROM_CULL, 0x20, 0x80, 0xff, 0xff);
+	}
 
 	{ //make some objects:
 		object_instances.clear();
@@ -2037,12 +2485,40 @@ void Tutorial::update(float dt) {
 			std::function<void(S72::Node const&, mat4 const&)> emit_node;
 			emit_node = [&](S72::Node const& n, mat4 const& parent_world) {
 				mat4 WORLD_FROM_LOCAL = mat4_mul(parent_world, local_from_node2(n));
-
+				
 
 				if (n.mesh) {
 					auto it = s72_mesh_to_range.find(n.mesh);
 					if (it != s72_mesh_to_range.end() && it->second.count > 0) {
 
+						ObjectVertices const& vr = it->second;
+
+						// build clip-from-local for culling  CLIP_FROM_CULL
+						mat4 CLIP_FROM_LOCAL_CULL = mat4_mul(CLIP_FROM_CULL, WORLD_FROM_LOCAL);
+
+						bool would_cull = aabb_is_culled_in_clip(
+							CLIP_FROM_LOCAL_CULL,
+							vr.local_min.x, vr.local_min.y, vr.local_min.z,
+							vr.local_max.x, vr.local_max.y, vr.local_max.z
+						);
+
+						bool culled = (enable_culling && would_cull);
+
+						if (camera_mode == CameraMode::Debug) {
+							// color scheme:
+							// - red: would be culled AND culling enabled (actually skipped)
+							// - yellow: would be culled BUT culling disabled (still drawn)
+							// - green: inside frustum
+							if (would_cull && enable_culling) {
+								add_aabb_lines(lines_vertices, WORLD_FROM_LOCAL, vr.local_min, vr.local_max, 0xff, 0x20, 0x20);
+							}
+							else if (would_cull && !enable_culling) {
+								add_aabb_lines(lines_vertices, WORLD_FROM_LOCAL, vr.local_min, vr.local_max, 0xff, 0xff, 0x20);
+							}
+							else {
+								add_aabb_lines(lines_vertices, WORLD_FROM_LOCAL, vr.local_min, vr.local_max, 0x20, 0xff, 0x20);
+							}
+						}
 						// pick texture from mesh material (fallback to checker=0)
 						uint32_t tex = 0;
 						if (n.mesh->material) {
@@ -2050,15 +2526,18 @@ void Tutorial::update(float dt) {
 							if (itM != material_to_texture.end()) tex = itM->second;
 						}
 
-						object_instances.emplace_back(ObjectInstance{
-							.vertices = it->second,
-							.transform{
-								.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
-								.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL, // good enough for now
+						if ((!culled)) {
+							object_instances.emplace_back(ObjectInstance{
+								.vertices = vr,
+								.transform{
+									// draw uses CLIP_FROM_WORLD (your usual shading camera)
+									.CLIP_FROM_LOCAL = CLIP_FROM_WORLD * WORLD_FROM_LOCAL,
+									.WORLD_FROM_LOCAL = WORLD_FROM_LOCAL,
+									.WORLD_FROM_LOCAL_NORMAL = WORLD_FROM_LOCAL,
 							},
 							.texture = tex,
-							});
+								});
+						}
 					}
 				}
 
@@ -2072,6 +2551,8 @@ void Tutorial::update(float dt) {
 			for (S72::Node* root : scene.scene.roots) {
 				if (root) emit_node(*root, I);
 			}
+
+
 			
 
 		}
@@ -2162,6 +2643,35 @@ void Tutorial::on_input(InputEvent const &evt) {
 	//if there is a current action, it gets input priority:
 	if (action) {
 		action(evt);
+		return;
+	}
+
+	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_R) {
+		anim_time = 0.0f;
+		anim_started = true;          // keep first-frame rule stable
+		apply_drivers(scene, anim_time);
+		std::cout << "[A1-move] restart anim_time=0\n";
+		return;
+	}
+
+	// animation controls 
+	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_SPACE) {
+		anim_paused = !anim_paused;
+		std::cout << "[A1-move] anim " << (anim_paused ? "PAUSED\n" : "PLAYING\n");
+		return;
+	}
+
+	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_N) {
+		anim_time += 1.0f / 30.0f; // step one frame at 30fps
+		apply_drivers(scene, anim_time);
+		std::cout << "[A1-move] step anim_time=" << anim_time << "\n";
+		return;
+	}
+
+
+	if (evt.type == InputEvent::KeyDown && evt.key.key == GLFW_KEY_V) {
+		enable_culling = !enable_culling;
+		std::cout << "[A1-cull] culling: " << (enable_culling ? "ON\n" : "OFF\n");
 		return;
 	}
 
@@ -2258,42 +2768,36 @@ void Tutorial::on_input(InputEvent const &evt) {
 
 
 		if (evt.type == InputEvent::MouseButtonDown && evt.button.button == GLFW_MOUSE_BUTTON_LEFT) {
-			//start tumbling
+			//start tumbling (rotate current cam)
 
-			//std::cout << "Tumble started." << std::endl;
+			 
 
 			float init_x = evt.button.x;
 			float init_y = evt.button.y;
-			OrbitCamera init_camera = free_camera;
+			OrbitCamera init_camera = cam;
 
-			action = [this, init_x,init_y,init_camera](InputEvent const& evt) {
+			action = [this, init_x, init_y, init_camera, &cam](InputEvent const& evt) {
 				if (evt.type == InputEvent::MouseButtonUp && evt.button.button == GLFW_MOUSE_BUTTON_LEFT) {
-					//cancel upon button lifted:
 					action = nullptr;
-
-					//std::cout << "Tumble ended." << std::endl;
 					return;
 				}
 				if (evt.type == InputEvent::MouseMotion) {
-					//motion, normalized so 1.0 is window height:
 					float dx = (evt.motion.x - init_x) / rtg.swapchain_extent.height;
-					float dy = -(evt.motion.y - init_y) / rtg.swapchain_extent.height; //note: negated because
-					//glfw uses y-down coordinate system
+					float dy = -(evt.motion.y - init_y) / rtg.swapchain_extent.height; //glfw y-down
 
-					//rotate camera based on motion:
-					float speed = float(M_PI); //how much rotation happens at one full window height
+					float speed = float(M_PI);
 					float flip_x = (std::abs(init_camera.elevation) > 0.5f * float(M_PI) ? -1.0f : 1.0f);
-					//switch azimuth rotation when camera is upside-down
-					free_camera.azimuth = init_camera.azimuth - dx * speed * flip_x;
-					free_camera.elevation = init_camera.elevation - dy * speed;
 
-					//reduce azimuth and elevation to [-pi,pi] range:
+					cam.azimuth = init_camera.azimuth - dx * speed * flip_x;
+					cam.elevation = init_camera.elevation - dy * speed;
+
 					const float twopi = 2.0f * float(M_PI);
-					free_camera.azimuth -= std::round(free_camera.azimuth / twopi) * twopi;
-					free_camera.elevation -= std::round(free_camera.elevation / twopi) * twopi;
+					cam.azimuth -= std::round(cam.azimuth / twopi) * twopi;
+					cam.elevation -= std::round(cam.elevation / twopi) * twopi;
 					return;
 				}
 				};
+
 			return;
 		}
 	}

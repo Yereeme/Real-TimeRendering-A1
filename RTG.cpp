@@ -19,6 +19,7 @@
 #include <sstream>
 #include <fstream>
 #include <set>
+ 
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
 	VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -108,7 +109,29 @@ void RTG::Configuration::parse(int argc, char **argv) {
 			scene_file = argv[argi];
 
 
-		} else {
+		} 
+		else if (arg == "--culling") {
+			if (argi + 1 >= argc) throw std::runtime_error("--culling requires a parameter (none or frustum).");
+			argi += 1;
+			std::string mode = argv[argi];
+
+			if (mode == "none") {
+				culling = CullingMode::None;
+			}
+			else if (mode == "frustum") {
+				culling = CullingMode::Frustum;
+			}
+			else {
+				throw std::runtime_error("--culling must be 'none' or 'frustum', got '" + mode + "'.");
+			}
+		}
+		else if (arg == "--camera") {
+			if (argi + 1 >= argc) throw std::runtime_error("--camera requires a parameter (camera name).");
+			argi += 1;
+			camera_name = argv[argi]; // <-- arbitrary camera name from the .s72
+		}
+
+		else {
 			throw std::runtime_error("Unrecognized argument '" + arg + "'.");
 		}
 	}
@@ -120,6 +143,8 @@ void RTG::Configuration::usage(std::function< void(const char *, const char *) >
 	callback("--drawing-size <w> <h>", "Set the size of the surface to draw to.");
 	callback("--headless", "Don't create a window; read events from stdin.");
 	callback("--scene <file.s72>", "Load the given .s72 scene file.");
+	callback("--culling none|frustum", "Select object culling mode.");
+	callback("--camera <name>", "Start in scene camera mode using the scene ccamera named <name>.");
 
 }
 

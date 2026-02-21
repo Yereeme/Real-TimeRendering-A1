@@ -4,6 +4,10 @@
 #include "PosNorTexVertex.hpp"
 #include "mat4.hpp"
 #include <string>
+#include <algorithm>
+#include <optional>
+
+ 
 
 #include "S72.hpp"
 #include "RTG.hpp"
@@ -12,7 +16,7 @@
 struct Tutorial : RTG::Application {
 
 	//Tutorial(RTG &);
-	Tutorial(RTG& rtg_, std::string const& scene_file_);
+	Tutorial(RTG& rtg, std::string const& scene_file, RTG::Configuration::CullingMode culling_mode);
 	Tutorial(Tutorial const &) = delete; //you shouldn't be copying this object
 	~Tutorial();
 
@@ -21,6 +25,12 @@ struct Tutorial : RTG::Application {
 	std::string scene_file;
 	S72 scene; //loaded s72 scene graph  
 	bool use_s72_scene = true;
+	std::vector<uint32_t> visible_instances;
+	
+	// camera override for headless (optional)
+	
+
+
  
 
 
@@ -162,11 +172,19 @@ struct Tutorial : RTG::Application {
 	struct ObjectVertices {
 		uint32_t first = 0;
 		uint32_t count = 0;
+
+		//local - space AABB for this mesh range :
+		S72::vec3 local_min{ +INFINITY, +INFINITY, +INFINITY }; //for each vertex position p update min
+		S72::vec3 local_max{ -INFINITY, -INFINITY, -INFINITY };
+
+
 	};
 
 	//--- S72 packed mesh ranges (one entry per scene.meshes[i]):
 	std::vector< ObjectVertices > s72_mesh_vertices;
 	std::unordered_map<S72::Mesh const*, ObjectVertices> s72_mesh_to_range;
+
+	
 
 	ObjectVertices plane_vertices;
 	ObjectVertices torus_vertices;
@@ -240,6 +258,9 @@ struct Tutorial : RTG::Application {
 		Debug = 2,
 	} camera_mode = CameraMode::User;
 
+	std::optional<Tutorial::CameraMode> forced_camera;
+
+
 	//render-time viewport/scissor (computed in update, applied in render)
 	VkViewport draw_viewport{};
 	VkRect2D   draw_scissor{};
@@ -279,8 +300,20 @@ struct Tutorial : RTG::Application {
 
 	};
 	std::vector< ObjectInstance > object_instances;
+
+	//visible list
+	std::vector<ObjectInstance> visible_object_instances;
+	RTG::Configuration::CullingMode culling_mode = RTG::Configuration::CullingMode::None;
+
+	bool enable_culling = false; //toggle
 	//--------------------------------------------------------------------
 	//Rendering function, uses all the resources above to queue work to draw a frame:
 
 	virtual void render(RTG &, RTG::RenderParams const &) override;
+
+	//   animation state  
+	bool anim_started = false;
+	float anim_time = 0.0f;
+	bool anim_paused = false;
+
 };

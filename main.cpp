@@ -24,13 +24,20 @@ int main(int argc, char **argv) {
 			.apiVersion = VK_API_VERSION_1_3
 		};
 		bool print_usage = false;
+		std::optional<Tutorial::CameraMode> forced_camera;
 
 		try {
 			configuration.parse(argc, argv);
+			
+
+
+
 		} catch (std::runtime_error &e) {
 			std::cerr << "Failed to parse arguments:\n" << e.what() << std::endl;
 			print_usage = true;
 		}
+
+	 ;
 
 		//require --scene:
 		if (configuration.scene_file.empty()) {
@@ -52,7 +59,9 @@ int main(int argc, char **argv) {
 		RTG rtg(configuration);
 
 		//initializes global (whole-life-of-application) resources:
-		Tutorial application(rtg, configuration.scene_file);//scene file gets passed into Tutorial
+		Tutorial application(rtg, configuration.scene_file, configuration.culling);//scene file gets passed into Tutorial
+		 
+
 
 		//main loop -- handles events, renders frames, etc:
 		rtg.run(application);
