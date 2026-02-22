@@ -27,6 +27,8 @@ static void collect_scene_cameras(S72 const& scene, std::vector<S72::Node const*
 
 Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_, RTG::Configuration::CullingMode culling_mode_) : rtg(rtg_), scene_file(scene_file_) {
 
+	//if (ft_log_enabled) ft_logger.stop();
+
 	culling_mode = culling_mode_;
 	enable_culling = (culling_mode_ == RTG::Configuration::CullingMode::Frustum);
 
@@ -469,7 +471,7 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_, RTG::Configuration
 	s72_mesh_to_range.clear();
 
 
-	// NOTE: scene.meshes is an unordered_map, so iteration order is arbitrary.
+	//   scene.meshes is an unordered_map, so iteration order is arbitrary.
 	// That's fine for now as long as we build instances using Mesh* later, not by index.
 	for (auto const& kv : scene.meshes) {
 		S72::Mesh const& mesh = kv.second;
@@ -601,6 +603,9 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_, RTG::Configuration
 
 	std::cout << "[A1-load] S72 packed total verts=" << packed.size() << " bytes=" << bytes << "\n";
 }
+
+// --- frame time logging (headless benchmarking helper) ---
+
 
 
 	if (scene_file.empty()) {
@@ -1189,6 +1194,12 @@ Tutorial::Tutorial(RTG& rtg_, std::string const& scene_file_, RTG::Configuration
 
 		vkUpdateDescriptorSets(rtg.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
 	}
+
+	// --- frame time logging 
+	//ft_log_enabled = rtg.configuration.headless;
+	//if (ft_log_enabled) {
+		//ft_logger.start("frametimes.csv");
+	//}
 }
 
 
@@ -1737,6 +1748,12 @@ void Tutorial::render(RTG& rtg_, RTG::RenderParams const& render_params) {
 
 		VK(vkQueueSubmit(rtg.graphics_queue, 1, &submit_info, render_params.workspace_available));
 	}
+
+	//log one sample per rendered frame
+	//frame_logger.tick(double frame_ms);
+	//if (rtg.configuration.headless) {
+		//frame_logger.tick(double frame_ms);
+	//}
 }
 
 static mat4 mat4_identity() {
@@ -2244,6 +2261,8 @@ void Tutorial::compute_letterbox(float target_aspect) {
 
 
 void Tutorial::update(float dt) {
+
+	
 
 	if (forced_camera.has_value()) {
 		camera_mode = forced_camera.value();

@@ -1,5 +1,5 @@
 #include "RTG.hpp"
-
+#include "Frame_Time_Logger.hpp"  
 #include "VK.hpp"
  
 
@@ -944,6 +944,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
 void RTG::run(Application& application) {
 
+
 	//initial on_swapchain
 	auto on_swapchain = [&, this]() {
 		application.on_swapchain(*this, SwapchainEvent{
@@ -968,6 +969,8 @@ void RTG::run(Application& application) {
 
 	// setup time handling
 	std::chrono::high_resolution_clock::time_point before = std::chrono::high_resolution_clock::now();
+
+	FrameTimeLogger frame_logger(configuration.headless, "frame_times.csv");
 
 	while (configuration.headless || !glfwWindowShouldClose(window)) {
 
@@ -999,7 +1002,7 @@ void RTG::run(Application& application) {
 							if (!headless_save.ends_with(".ppm")) throw std::runtime_error("output filename ("" + headless_save + "") must end with .ppm");
 						}
 
-						//TODO: check for trailing junk
+						// check for trailing junk
 						char junk;
 						if (iss >> junk) throw std::runtime_error("trailing junk in event line");
 
@@ -1021,6 +1024,7 @@ void RTG::run(Application& application) {
 		}
 		else {
 			glfwPollEvents();
+
 		}
 
 		//deliver all input events to application:
@@ -1040,6 +1044,10 @@ void RTG::run(Application& application) {
 			if (configuration.headless) dt = headless_dt;
 
 			application.update(dt);
+
+			//if (configuration.headless) {
+				//frame_logger.tick(double(dt) * 1000.0); // dt is "simulation dt" from AVAILABLE
+			//}
 		}
 
 		//render handling (with on_swapchain as needed):
@@ -1119,6 +1127,9 @@ void RTG::run(Application& application) {
 
 			
 		}
+		// ---- frame timing start (CPU wall clock) ----
+		auto frame_start = std::chrono::high_resolution_clock::now();
+
 		// queue rendering work (CALL RENDER FUNCTION)
 		application.render(*this, RenderParams{
 			.workspace_index = workspace_index,
@@ -1128,11 +1139,11 @@ void RTG::run(Application& application) {
 			.workspace_available = workspaces[workspace_index].workspace_available,
 			});
 
-		{//present image (resize swapchain if needed) (queue the work for presentations):
+		 
+		// present / copy out:
+		{
 			if (configuration.headless) {
 				//in headless mode, submit the copy command we recorded previously:
-
-				//will wait in the transfer stage for image_done to be signaled:
 				VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 				VkSubmitInfo submit_info{
 					.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1142,9 +1153,10 @@ void RTG::run(Application& application) {
 					.commandBufferCount = 1,
 					.pCommandBuffers = &headless_swapchain[image_index].copy_command,
 				};
-
 				VK(vkQueueSubmit(graphics_queue, 1, &submit_info, headless_swapchain[image_index].image_presented));
 
+				// IMPORTANT: block until the copy finishes so the timing reflects actual GPU work:
+				VK(vkWaitForFences(device, 1, &headless_swapchain[image_index].image_presented, VK_TRUE, UINT64_MAX));
 			}
 			else {
 				VkPresentInfoKHR present_info{
@@ -1158,7 +1170,6 @@ void RTG::run(Application& application) {
 
 				assert(present_queue);
 
-				//note, again, the careful return handling:
 				if (VkResult result = vkQueuePresentKHR(present_queue, &present_info);
 					result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
 					std::cerr << "Recreating swapchain because vkQueuePresentKHR returned " << string_VkResult(result) << "." << std::endl;
@@ -1168,8 +1179,21 @@ void RTG::run(Application& application) {
 				else if (result != VK_SUCCESS) {
 					throw std::runtime_error("failed to queue presentation of image (" + std::string(string_VkResult(result)) + ")!");
 				}
+
+				// IMPORTANT: wait so the timing reflects GPU completion for this frame:
+				VK(vkWaitForFences(device, 1, &workspaces[workspace_index].workspace_available, VK_TRUE, UINT64_MAX));
 			}
 		}
+
+		// ---- frame timing end ----
+		auto frame_end = std::chrono::high_resolution_clock::now();
+		double frame_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
+
+		frame_logger.tick(frame_ms);
+
+		//if (!configuration.headless) {
+			//frame_logger.tick(frame_ms);
+		//}
 	}
 
 		//wait for any in-flight "headless" frames marked for saving to finish:

@@ -31,6 +31,7 @@ const main_objs = [
 	maek.CPP('PosColVertex.cpp'),
 	maek.CPP('PosNorTexVertex.cpp'),
 	maek.CPP('tinyobjloarder_impl.cpp'),
+	maek.CPP('frame_time_logger.cpp'),
 	maek.CPP('stb_image_impl.cpp'),
 	maek.CPP('RTG.cpp'),
 	maek.CPP('Helpers.cpp'),

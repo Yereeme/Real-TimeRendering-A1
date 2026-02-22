@@ -6,7 +6,7 @@
 #include <string>
 #include <algorithm>
 #include <optional>
-
+#include "frame_time_logger.hpp"
  
 
 #include "S72.hpp"
@@ -26,7 +26,9 @@ struct Tutorial : RTG::Application {
 	S72 scene; //loaded s72 scene graph  
 	bool use_s72_scene = true;
 	std::vector<uint32_t> visible_instances;
+	//FrameTimeLogger frame_logger;
 	
+	//bool ft_log_enabled = false;
 	// camera override for headless (optional)
 	
 
